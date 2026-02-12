@@ -222,7 +222,7 @@ def plot_umap_order_family_shaded(
         species_sorted, order_labels, family_labels,
         max_orders=max_orders, max_families_per_order=max_families_per_order
     )
-    colors, order_base_color, family_color = assign_order_family_colors(order_top, family_top, max_orders=max_orders)
+    colors, order_base_color, family_color = assign_order_family_colors(order_top, family_top)
 
     plt.figure(figsize=(11, 9))
     plt.scatter(X2[:, 0], X2[:, 1], s=point_size, alpha=alpha, c=colors, linewidths=0)
