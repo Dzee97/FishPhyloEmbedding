@@ -141,7 +141,6 @@ def make_hierarchical_labels(
 def assign_order_family_colors(
     order_top,
     family_top,
-    max_orders=12,
 ):
     """
     Returns:
@@ -150,7 +149,7 @@ def assign_order_family_colors(
       family_color: dict (order, family) -> rgb
     """
     # Base colors for top orders (distinct hues)
-    base_cmap = plt.get_cmap("tab20")
+    base_cmap = plt.get_cmap("tab10")
     # tab20 has 20 distinct-ish colors; we’ll take first max_orders
     unique_orders = [o for o, _ in Counter(order_top).most_common()]
 
@@ -203,12 +202,12 @@ def plot_umap_order_family_shaded(
     family_labels,
     outpath,
     title="UMAP — Orders as colors, Families as shades",
-    max_orders=12,
-    max_families_per_order=12,
+    max_orders=3,
+    max_families_per_order=5,
     point_size=8,
-    alpha=0.8,
+    alpha=1.0,
     legend_orders=True,
-    legend_families_per_order=4,
+    legend_families_per_order=5,
 ):
     """
     Single plot:
@@ -296,10 +295,6 @@ def main():
         family_labels=family_labels,
         outpath=args.out_dir / "umap_order_family_shaded.png",
         title="UMAP of species anchors — Order hue, Family shade",
-        max_orders=3,
-        max_families_per_order=3,
-        legend_orders=True,
-        legend_families_per_order=3,   # keep legend manageable
     )
 
     print("Wrote plots to:", args.out_dir)
