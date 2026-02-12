@@ -148,7 +148,7 @@ def scatter_plot_2d(
             )
     else:
         # Plot all points once with explicit colors
-        plt.scatter(X2[:, 0], X2[:, 1], s=8, alpha=0.7, c=colors, linewidths=0)
+        plt.scatter(X2[:, 0], X2[:, 1], s=8, alpha=0.7, c=colors)
 
         # Add legend handles for classes only (skip excluded labels)
         for u in uniq:
