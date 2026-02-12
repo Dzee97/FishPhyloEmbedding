@@ -2,19 +2,23 @@
 """
 Evaluation script: PCA + UMAP visualization of learned species anchor embeddings.
 
-Changes requested:
-- Separate max classes for order and family:
-    --max_orders, --max_families
-- Instead of one global family plot, make:
-    - one ORDER plot (top orders)
-    - separate FAMILY plots per top order (top families within that order)
+Reads:
+- Training checkpoint (.pt) from baseline script
+- species_taxonomy.tsv for family/order labels
 
 Writes:
 - pca_order.png
-- pca_families_in_<ORDER>.png for each top order
+- pca_families_in_<ORDER>.png for each top order (shows ALL points; non-target orders in gray)
 - umap_order.png (if umap-learn installed)
-- umap_families_in_<ORDER>.png for each top order (if umap-learn installed)
+- umap_families_in_<ORDER>.png for each top order (shows ALL points; non-target orders in gray)
 - summary.txt
+
+Key features:
+- Separate caps:
+    --max_orders (for order plot + choosing which per-order plots to make)
+    --max_families (top families within each selected order)
+- Per-order family plots show all points, but highlight families only within that order.
+- Legend excludes background points.
 
 Dependencies:
   pip install torch numpy scikit-learn matplotlib
@@ -102,20 +106,66 @@ def slugify(s: str) -> str:
     return s[:80] if len(s) > 80 else s
 
 
-def scatter_plot_2d(X2, labels, title, outpath, max_classes=25, xlabel="dim1", ylabel="dim2"):
+def scatter_plot_2d(
+    X2,
+    labels,
+    title,
+    outpath,
+    max_classes=25,
+    xlabel="dim1",
+    ylabel="dim2",
+    colors=None,
+    legend_exclude=None,
+):
+    """
+    Scatter plot with optional explicit per-point colors.
+
+    - labels: list[str], used to build legend after top-K collapsing
+    - colors: optional list/array of matplotlib colors (len N). If set, points are plotted in one call.
+    - legend_exclude: set of label names to omit from legend (e.g., {"Background"})
+    """
+    if legend_exclude is None:
+        legend_exclude = set()
+
     counts = Counter(labels)
     top = set([k for k, _ in counts.most_common(max_classes)])
     labels2 = [lab if lab in top else "Other" for lab in labels]
 
-    uniq = list(dict.fromkeys(labels2))
+    # Legend classes in stable order
+    uniq = [u for u in dict.fromkeys(labels2) if u not in legend_exclude]
+
     plt.figure(figsize=(10, 8))
-    for u in uniq:
-        idx = np.where(np.array(labels2) == u)[0]
-        plt.scatter(X2[idx, 0], X2[idx, 1], s=8, alpha=0.7, label=f"{u} (n={len(idx)})")
+    labels2_arr = np.array(labels2)
+
+    if colors is None:
+        # Plot per class (easy legend)
+        for u in uniq:
+            idx = np.where(labels2_arr == u)[0]
+            plt.scatter(
+                X2[idx, 0], X2[idx, 1],
+                s=8, alpha=0.7,
+                label=f"{u} (n={len(idx)})"
+            )
+    else:
+        # Plot all points once with explicit colors
+        plt.scatter(X2[:, 0], X2[:, 1], s=8, alpha=0.7, c=colors, linewidths=0)
+
+        # Add legend handles for classes only (skip excluded labels)
+        for u in uniq:
+            idx = np.where(labels2_arr == u)[0]
+            if len(idx) == 0:
+                continue
+            col = colors[idx[0]]
+            plt.scatter(
+                [], [], s=30,
+                color=col, alpha=0.9,
+                label=f"{u} (n={len(idx)})"
+            )
+
     plt.title(title)
     plt.xlabel(xlabel)
     plt.ylabel(ylabel)
-    plt.legend(markerscale=2, fontsize=8, loc="best")
+    plt.legend(markerscale=1.5, fontsize=8, loc="best")
     plt.tight_layout()
     plt.savefig(outpath, dpi=200)
     plt.close()
@@ -136,31 +186,62 @@ def per_order_family_plots(
     max_families: int,
     xlabel: str = "dim1",
     ylabel: str = "dim2",
+    background_color=(0.82, 0.82, 0.82, 0.35),  # light gray with alpha
 ):
     """
-    Creates one plot per top order:
-      - includes ONLY points from that order
-      - colors by family (top families within that order), rest -> Other
+    For each top order o:
+      - plot ALL points (global context)
+      - points in order o are colored by family (top families within that order)
+      - points outside order o are background gray
+      - legend excludes "Background"
     """
     order_arr = np.array(order_labels)
     family_arr = np.array(family_labels)
 
-    for o in top_order_list:
-        mask = (order_arr == o)
-        if mask.sum() == 0:
-            continue
+    cmap = plt.get_cmap("tab20")
 
-        Xo = X2[mask]
-        fams = family_arr[mask].tolist()
+    for o in top_order_list:
+        in_order = (order_arr == o)
+
+        # Determine top families within this order
+        fams_in = family_arr[in_order].tolist()
+        fam_counts = Counter(fams_in)
+        top_fams = [f for f, _ in fam_counts.most_common(max_families)]
+        top_fams_set = set(top_fams)
+
+        # Labels for legend (Background excluded later)
+        labels = []
+        for i in range(len(order_arr)):
+            if in_order[i]:
+                f = family_arr[i]
+                labels.append(f if f in top_fams_set else "Other")
+            else:
+                labels.append("Background")
+
+        # Colors: background gray; inside-order families get tab20 colors; Other = dark gray
+        fam_to_color = {}
+        for j, fam in enumerate(top_fams):
+            fam_to_color[fam] = cmap(j % 20)
+        fam_to_color["Other"] = (0.35, 0.35, 0.35, 0.9)
+        bg = background_color
+
+        colors = []
+        for lab in labels:
+            if lab == "Background":
+                colors.append(bg)
+            else:
+                colors.append(fam_to_color.get(lab, fam_to_color["Other"]))
 
         outpath = out_dir / f"{prefix}_families_in_{slugify(o)}.png"
         scatter_plot_2d(
-            Xo, fams,
-            title=f"{prefix.upper()} — Families within order: {o}",
+            X2, labels,
+            title=f"{prefix.upper()} — Families highlighted within order: {o}",
             outpath=outpath,
-            max_classes=max_families,
+            max_classes=max_families + 2,  # allow top families + Other + Background (excluded from legend)
             xlabel=xlabel,
             ylabel=ylabel,
+            colors=colors,
+            legend_exclude={"Background"},
         )
 
 
@@ -172,12 +253,12 @@ def main():
 
     ap.add_argument("--pca_components", type=int, default=50)
 
-    # NEW: separate caps
-    ap.add_argument("--max_orders", type=int, default=15, help="Max orders to show (others -> Other)")
-    ap.add_argument("--max_families", type=int, default=20,
-                    help="Max families to show within each top order (others -> Other)")
+    # Separate caps
+    ap.add_argument("--max_orders", type=int, default=12,
+                    help="Max orders to show (and to generate per-order plots for)")
+    ap.add_argument("--max_families", type=int, default=15, help="Max families to show within each selected order")
 
-    # UMAP params (kept as before, but exposed for convenience)
+    # UMAP params
     ap.add_argument("--umap_neighbors", type=int, default=30)
     ap.add_argument("--umap_min_dist", type=float, default=0.2)
 
@@ -187,7 +268,7 @@ def main():
     species_sorted, family_labels, order_labels = read_species_taxonomy_tsv(args.species_taxonomy_tsv)
     W = load_species_embeddings_from_ckpt(args.ckpt, num_species_expected=len(species_sorted))
 
-    # Determine top orders once (based on all species)
+    # Determine top orders once
     top_order_list = top_orders(order_labels, args.max_orders)
 
     # --------------------
@@ -208,7 +289,7 @@ def main():
         xlabel=xlabel, ylabel=ylabel
     )
 
-    # Family plots per top order
+    # Per-order family highlight plots (global points shown)
     per_order_family_plots(
         X_pca2,
         order_labels=order_labels,
@@ -244,7 +325,7 @@ def main():
             max_classes=args.max_orders,
         )
 
-        # Family plots per top order
+        # Per-order family highlight plots (global points shown)
         per_order_family_plots(
             X_umap,
             order_labels=order_labels,
