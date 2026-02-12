@@ -150,7 +150,7 @@ def main():
         pca = PCA(n_components=min(args.pca_components, W.shape[1]), random_state=0)
         Wp = pca.fit_transform(W)
         reducer = umap.UMAP(
-            n_neighbors=5,
+            n_neighbors=50,
             min_dist=0.2,
             n_components=2,
             metric="cosine",
