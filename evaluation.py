@@ -198,7 +198,7 @@ def per_order_family_plots(
     order_arr = np.array(order_labels)
     family_arr = np.array(family_labels)
 
-    cmap = plt.get_cmap("tab20")
+    cmap = plt.get_cmap("tab10")
 
     for o in top_order_list:
         in_order = (order_arr == o)
