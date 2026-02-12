@@ -18,18 +18,15 @@ Dependencies:
 
 import argparse
 from pathlib import Path
-from collections import Counter
+from collections import Counter, defaultdict
+import colorsys
 
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
 from sklearn.decomposition import PCA
 
-try:
-    import umap
-    HAS_UMAP = True
-except Exception:
-    HAS_UMAP = False
+import umap
 
 
 def read_species_taxonomy_tsv(path: Path):
@@ -89,20 +86,179 @@ def load_species_embeddings_from_ckpt(ckpt_path: Path, num_species_expected: int
     return W
 
 
-def scatter_plot_2d(X2, labels, title, outpath, max_classes=25, xlabel="dim1", ylabel="dim2"):
-    counts = Counter(labels)
-    top = set([k for k, _ in counts.most_common(max_classes)])
-    labels2 = [lab if lab in top else "Other" for lab in labels]
+def _lighten_rgb(rgb, amount):
+    """
+    amount in [0,1]; 0 = original, 1 = white
+    """
+    r, g, b = rgb
+    return (r + (1 - r) * amount, g + (1 - g) * amount, b + (1 - b) * amount)
 
-    uniq = list(dict.fromkeys(labels2))
-    plt.figure(figsize=(10, 8))
-    for u in uniq:
-        idx = np.where(np.array(labels2) == u)[0]
-        plt.scatter(X2[idx, 0], X2[idx, 1], s=8, alpha=0.7, label=f"{u} (n={len(idx)})")
+
+def make_hierarchical_labels(
+    species_sorted,
+    order_labels,
+    family_labels,
+    max_orders=12,
+    max_families_per_order=12,
+):
+    """
+    Returns:
+      order_top: list[str]  (order, with rare -> OtherOrder)
+      family_top: list[str] (family, with rare-within-order -> OtherFamily)
+    """
+    # Top orders globally
+    order_counts = Counter(order_labels)
+    top_orders = [o for o, _ in order_counts.most_common(max_orders)]
+    top_orders_set = set(top_orders)
+
+    order_top = [o if o in top_orders_set else "OtherOrder" for o in order_labels]
+
+    # Top families within each kept order
+    fam_counts_by_order = defaultdict(Counter)
+    for o, f in zip(order_top, family_labels):
+        fam_counts_by_order[o][f if f else "Unknown"] += 1
+
+    top_fams_by_order = {}
+    for o, c in fam_counts_by_order.items():
+        # For OtherOrder we typically won't subdivide too much
+        if o == "OtherOrder":
+            top_fams_by_order[o] = set()
+            continue
+        top_fams = [fam for fam, _ in c.most_common(max_families_per_order)]
+        top_fams_by_order[o] = set(top_fams)
+
+    family_top = []
+    for o, f in zip(order_top, family_labels):
+        f = f if f else "Unknown"
+        if o == "OtherOrder":
+            family_top.append("OtherFamily")
+        else:
+            family_top.append(f if f in top_fams_by_order[o] else "OtherFamily")
+
+    return order_top, family_top
+
+
+def assign_order_family_colors(
+    order_top,
+    family_top,
+    max_orders=12,
+):
+    """
+    Returns:
+      colors: list[(r,g,b)] for each point
+      order_base_color: dict order -> rgb
+      family_color: dict (order, family) -> rgb
+    """
+    # Base colors for top orders (distinct hues)
+    base_cmap = plt.get_cmap("tab20")
+    # tab20 has 20 distinct-ish colors; we’ll take first max_orders
+    unique_orders = [o for o, _ in Counter(order_top).most_common()]
+
+    # Ensure "OtherOrder" is last (gray)
+    unique_orders = [o for o in unique_orders if o != "OtherOrder"] + \
+        (["OtherOrder"] if "OtherOrder" in unique_orders else [])
+
+    order_base_color = {}
+    color_idx = 0
+    for o in unique_orders:
+        if o == "OtherOrder":
+            order_base_color[o] = (0.6, 0.6, 0.6)
+        else:
+            order_base_color[o] = base_cmap(color_idx % 20)[:3]
+            color_idx += 1
+
+    # Shades within order for families: vary lightness towards white
+    family_color = {}
+    for o in unique_orders:
+        base = order_base_color[o]
+        # collect families within this order (excluding OtherFamily last)
+        fams = [f for f, _ in Counter([f for oo, f in zip(order_top, family_top) if oo == o]).most_common()]
+        if "OtherFamily" in fams:
+            fams = [f for f in fams if f != "OtherFamily"] + ["OtherFamily"]
+
+        # Choose shade amounts: evenly spaced lightening
+        n = max(1, len(fams))
+        # Darkest = near base, lightest = quite light
+        # Keep range moderate so families are distinguishable but still "same hue"
+        min_amt, max_amt = (0.10, 0.75) if o != "OtherOrder" else (0.0, 0.0)
+
+        for i, f in enumerate(fams):
+            if o == "OtherOrder":
+                family_color[(o, f)] = base
+            else:
+                amt = min_amt + (max_amt - min_amt) * (i / max(1, n - 1))
+                # OtherFamily: make it lightest so it reads as “misc”
+                if f == "OtherFamily":
+                    amt = 0.88
+                family_color[(o, f)] = _lighten_rgb(base, amt)
+
+    colors = [family_color[(o, f)] for o, f in zip(order_top, family_top)]
+    return colors, order_base_color, family_color
+
+
+def plot_umap_order_family_shaded(
+    X2,
+    species_sorted,
+    order_labels,
+    family_labels,
+    outpath,
+    title="UMAP — Orders as colors, Families as shades",
+    max_orders=12,
+    max_families_per_order=12,
+    point_size=8,
+    alpha=0.8,
+    legend_orders=True,
+    legend_families_per_order=4,
+):
+    """
+    Single plot:
+      - top orders get distinct colors
+      - families within an order get shades of that order's color
+
+    Legend strategy:
+      - Always show order legend (recommended)
+      - Optionally show up to N families per order (can get huge otherwise)
+    """
+    order_top, family_top = make_hierarchical_labels(
+        species_sorted, order_labels, family_labels,
+        max_orders=max_orders, max_families_per_order=max_families_per_order
+    )
+    colors, order_base_color, family_color = assign_order_family_colors(order_top, family_top, max_orders=max_orders)
+
+    plt.figure(figsize=(11, 9))
+    plt.scatter(X2[:, 0], X2[:, 1], s=point_size, alpha=alpha, c=colors, linewidths=0)
     plt.title(title)
-    plt.xlabel(xlabel)
-    plt.ylabel(ylabel)
-    plt.legend(markerscale=2, fontsize=8, loc="best")
+    plt.xlabel("dim1")
+    plt.ylabel("dim2")
+
+    handles = []
+    labels = []
+
+    # Order legend (base colors)
+    if legend_orders:
+        for o, _ in Counter(order_top).most_common():
+            handles.append(plt.Line2D([0], [0], marker='o', color='w',
+                                      markerfacecolor=order_base_color[o], markersize=8))
+            labels.append(f"Order: {o} (n={Counter(order_top)[o]})")
+
+    # Optional: a small family legend subset per order (top N families)
+    if legend_families_per_order and legend_families_per_order > 0:
+        fam_counts_by_order = defaultdict(Counter)
+        for o, f in zip(order_top, family_top):
+            fam_counts_by_order[o][f] += 1
+
+        for o, _ in Counter(order_top).most_common():
+            if o == "OtherOrder":
+                continue
+            fams = [f for f, _ in fam_counts_by_order[o].most_common(legend_families_per_order)]
+            for f in fams:
+                handles.append(plt.Line2D([0], [0], marker='o', color='w',
+                                          markerfacecolor=family_color[(o, f)], markersize=7))
+                labels.append(f"  {o} → {f} (n={fam_counts_by_order[o][f]})")
+
+    if handles:
+        plt.legend(handles, labels, fontsize=8, loc="best", frameon=True, markerscale=1)
+
     plt.tight_layout()
     plt.savefig(outpath, dpi=200)
     plt.close()
@@ -122,62 +278,28 @@ def main():
     species_sorted, family_labels, order_labels = read_species_taxonomy_tsv(args.species_taxonomy_tsv)
     W = load_species_embeddings_from_ckpt(args.ckpt, num_species_expected=len(species_sorted))
 
-    # PCA 2D
-    pca2 = PCA(n_components=2, random_state=0)
-    X_pca2 = pca2.fit_transform(W)
-    var = pca2.explained_variance_ratio_
-
-    xlabel = f"PC1 ({var[0]*100:.1f}% var)"
-    ylabel = f"PC2 ({var[1]*100:.1f}% var)"
-
-    scatter_plot_2d(
-        X_pca2, family_labels,
-        title="PCA (2D) of species anchor embeddings — colored by Family",
-        outpath=args.out_dir / "pca_family.png",
-        max_classes=args.max_classes,
-        xlabel=xlabel, ylabel=ylabel
+    pca = PCA(n_components=min(args.pca_components, W.shape[1]), random_state=0)
+    Wp = pca.fit_transform(W)
+    reducer = umap.UMAP(
+        n_neighbors=30,
+        min_dist=0.2,
+        n_components=2,
+        metric="cosine",
+        random_state=0
     )
-    scatter_plot_2d(
-        X_pca2, order_labels,
-        title="PCA (2D) of species anchor embeddings — colored by Order",
-        outpath=args.out_dir / "pca_order.png",
-        max_classes=args.max_classes,
-        xlabel=xlabel, ylabel=ylabel
-    )
+    X_umap = reducer.fit_transform(Wp)
 
-    # UMAP (optional)
-    if HAS_UMAP:
-        pca = PCA(n_components=min(args.pca_components, W.shape[1]), random_state=0)
-        Wp = pca.fit_transform(W)
-        reducer = umap.UMAP(
-            n_neighbors=30,
-            min_dist=0.2,
-            n_components=2,
-            metric="cosine",
-            random_state=0
-        )
-        X_umap = reducer.fit_transform(Wp)
-
-        scatter_plot_2d(
-            X_umap, family_labels,
-            title="UMAP of species anchor embeddings — colored by Family",
-            outpath=args.out_dir / "umap_family.png",
-            max_classes=args.max_classes,
-        )
-        scatter_plot_2d(
-            X_umap, order_labels,
-            title="UMAP of species anchor embeddings — colored by Order",
-            outpath=args.out_dir / "umap_order.png",
-            max_classes=args.max_classes,
-        )
-    else:
-        print("umap-learn not installed; skipping UMAP. Install with: pip install umap-learn")
-
-    (args.out_dir / "summary.txt").write_text(
-        f"Species plotted: {len(species_sorted)}\n"
-        f"Embedding dim: {W.shape[1]}\n"
-        f"UMAP available: {HAS_UMAP}\n",
-        encoding="utf-8"
+    plot_umap_order_family_shaded(
+        X_umap,
+        species_sorted=species_sorted,
+        order_labels=order_labels,
+        family_labels=family_labels,
+        outpath=args.out_dir / "umap_order_family_shaded.png",
+        title="UMAP of species anchors — Order hue, Family shade",
+        max_orders=3,
+        max_families_per_order=3,
+        legend_orders=True,
+        legend_families_per_order=3,   # keep legend manageable
     )
 
     print("Wrote plots to:", args.out_dir)
