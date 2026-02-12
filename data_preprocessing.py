@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
 """
-Torch-free preprocessing for Mare-MAGE COI-90DB + Fish Tree of Life Newick,
-with detailed "drop examples" reporting (first N examples per drop reason).
+Torch-free preprocessing for Mare-MAGE COI + Fish Tree of Life Newick,
+with detailed drop examples AND taxonomy/rank retention for downstream evaluation.
 
-Outputs:
+NEW/CHANGED OUTPUTS:
+  - sequences.jsonl now includes:
+      taxonomy (full string), order, family, genus_raw, species_raw
+  - species_taxonomy.tsv (one row per species with majority-vote order/family/genus + counts)
+
+Existing outputs kept:
   - pruned_tree.newick
   - edge_index.npz, edge_attr.npz
   - nodes.tsv, leaf_map.tsv
-  - sequences.jsonl
   - report.txt
-  - drop_examples.txt   <-- NEW
+  - drop_examples.txt
 
 Requires:
   pip install biopython networkx numpy
@@ -20,7 +24,7 @@ import json
 import re
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Dict, Optional, List, Set, Tuple
+from typing import Dict, Optional, List, Tuple
 
 import numpy as np
 import networkx as nx
@@ -57,6 +61,32 @@ class DropRecorder:
 
 
 # ---------------------------
+# Taxonomy parsing
+# ---------------------------
+
+def parse_tax_ranks(tax: str) -> dict:
+    """
+    Mare-MAGE taxonomy parts look like:
+      ...;O_Spariformes;F_Sparidae;G_Diplodus;s_Diplodus sargus helenae
+
+    Returns dict with raw (un-normalized) values:
+      order, family, genus_raw, species_raw
+    """
+    out = {"order": None, "family": None, "genus_raw": None, "species_raw": None}
+    for part in tax.split(";"):
+        part = part.strip()
+        if part.startswith("O_"):
+            out["order"] = part[2:]
+        elif part.startswith("F_"):
+            out["family"] = part[2:]
+        elif part.startswith("G_"):
+            out["genus_raw"] = part[2:]
+        elif part.startswith("s_"):
+            out["species_raw"] = part[2:]
+    return out
+
+
+# ---------------------------
 # Species name handling
 # ---------------------------
 
@@ -66,6 +96,10 @@ def extract_species_from_taxonomy(tax: str) -> Optional[str]:
 
 
 def normalize_species_name(raw: str, collapse_subspecies: bool = True) -> Optional[str]:
+    """
+    Normalizes a raw species string to Genus_species (underscore).
+    If collapse_subspecies=True (recommended), uses only first two tokens.
+    """
     raw = raw.strip().strip("'").strip('"').replace("_", " ")
     raw = re.sub(r"\s+", " ", raw)
     parts = raw.split()
@@ -84,7 +118,7 @@ def normalize_species_name(raw: str, collapse_subspecies: bool = True) -> Option
     genus = genus.capitalize()
     species = species.lower()
 
-    # Collapse trinomial to binomial by default
+    # NOTE: collapse_subspecies True means always binomial. If False, keep trinomial.
     if not collapse_subspecies and len(parts) >= 3:
         sub = re.sub(r"[^A-Za-z\-]", "", parts[2]).lower()
         if sub and sub not in BAD_TOKENS:
@@ -210,6 +244,8 @@ def main():
     # -----------------------
     raw_rows = 0
     seq_to_species_raw: Dict[str, str] = {}
+    seq_to_taxonomy_raw: Dict[str, str] = {}
+    seq_to_ranks_raw: Dict[str, dict] = {}
 
     with open(args.taxonomy, encoding="utf-8") as f:
         for line in f:
@@ -234,10 +270,16 @@ def main():
                 continue
 
             seq_to_species_raw[seq_id] = sp
+            seq_to_taxonomy_raw[seq_id] = tax
+            seq_to_ranks_raw[seq_id] = parse_tax_ranks(tax)
 
-    log_step(report_lines, "After taxonomy parse", len(seq_to_species_raw),
-             count_species_from_seq_map(seq_to_species_raw),
-             extra=f"input_rows={raw_rows} drops={sum(drops.counts.values())}")
+    log_step(
+        report_lines,
+        "After taxonomy parse",
+        len(seq_to_species_raw),
+        count_species_from_seq_map(seq_to_species_raw),
+        extra=f"input_rows={raw_rows} drops={sum(drops.counts.values())}",
+    )
 
     # --------------------------------------
     # Step 2: Load FASTA (match seq IDs)
@@ -257,10 +299,18 @@ def main():
     missing_in_fasta = sorted(set(seq_to_species_raw.keys()) - set(seqs_raw.keys()))
     drops.add_many("taxonomy_id_missing_in_fasta", missing_in_fasta)
 
+    # Filter all seq-id keyed dicts to those present in FASTA
     seq_to_species = {sid: sp for sid, sp in seq_to_species_raw.items() if sid in seqs_raw}
-    log_step(report_lines, "After FASTA ID matching", len(seqs_raw),
-             count_species_from_seq_map(seq_to_species),
-             extra=f"fasta_records={fasta_seen} missing_tax_ids_in_fasta={len(missing_in_fasta)}")
+    seq_to_taxonomy = {sid: tx for sid, tx in seq_to_taxonomy_raw.items() if sid in seqs_raw}
+    seq_to_ranks = {sid: rk for sid, rk in seq_to_ranks_raw.items() if sid in seqs_raw}
+
+    log_step(
+        report_lines,
+        "After FASTA ID matching",
+        len(seqs_raw),
+        count_species_from_seq_map(seq_to_species),
+        extra=f"fasta_records={fasta_seen} missing_tax_ids_in_fasta={len(missing_in_fasta)}",
+    )
 
     # --------------------------------------
     # Step 3: Sequence filters
@@ -276,10 +326,18 @@ def main():
             continue
         seqs_filt[sid] = seq
 
-    seq_to_species = {sid: sp for sid, sp in seq_to_species.items() if sid in seqs_filt}
-    log_step(report_lines, "After length/N filters", len(seqs_filt),
-             count_species_from_seq_map(seq_to_species),
-             extra=f"min_len={args.min_len} max_N_frac={args.max_N_frac}")
+    keep_ids = set(seqs_filt.keys())
+    seq_to_species = {sid: sp for sid, sp in seq_to_species.items() if sid in keep_ids}
+    seq_to_taxonomy = {sid: tx for sid, tx in seq_to_taxonomy.items() if sid in keep_ids}
+    seq_to_ranks = {sid: rk for sid, rk in seq_to_ranks.items() if sid in keep_ids}
+
+    log_step(
+        report_lines,
+        "After length/N filters",
+        len(seqs_filt),
+        count_species_from_seq_map(seq_to_species),
+        extra=f"min_len={args.min_len} max_N_frac={args.max_N_frac}",
+    )
 
     # --------------------------------------
     # Step 4: Species min sequences
@@ -299,12 +357,18 @@ def main():
 
         seqs_filt = {sid: seq for sid, seq in seqs_filt.items() if sid in kept_seq_ids}
         seq_to_species = {sid: sp for sid, sp in seq_to_species.items() if sid in kept_seq_ids}
+        seq_to_taxonomy = {sid: tx for sid, tx in seq_to_taxonomy.items() if sid in kept_seq_ids}
+        seq_to_ranks = {sid: rk for sid, rk in seq_to_ranks.items() if sid in kept_seq_ids}
     else:
         species_keep = set(species_to_ids.keys())
 
-    log_step(report_lines, "After min-seqs/species", len(seqs_filt),
-             len(species_keep),
-             extra=f"min_seqs/species={args.require_min_seqs_per_species}")
+    log_step(
+        report_lines,
+        "After min-seqs/species",
+        len(seqs_filt),
+        len(species_keep),
+        extra=f"min_seqs/species={args.require_min_seqs_per_species}",
+    )
 
     # -----------------------
     # Step 5: Load Fish Tree
@@ -313,8 +377,13 @@ def main():
     tree_tips_before = tree.count_terminals()
     tip_norm_map = iter_terminals_with_norm(tree, collapse_subspecies=True)
     tree_species_set = set(tip_norm_map.values())
-    log_step(report_lines, "Fish tree loaded", 0, 0,
-             extra=f"tree_tips={tree_tips_before} normalized_tip_species={len(tree_species_set)}")
+    log_step(
+        report_lines,
+        "Fish tree loaded",
+        0,
+        0,
+        extra=f"tree_tips={tree_tips_before} normalized_tip_species={len(tree_species_set)}",
+    )
 
     # --------------------------------------
     # Step 6: Species ∩ tree tips (record missing species!)
@@ -323,8 +392,13 @@ def main():
     missing_species = sorted(list(species_keep - tree_species_set))
     drops.add_many("species_missing_in_tree_tips", missing_species)
 
-    log_step(report_lines, "Species ∩ tree tips", 0, len(intersect_species),
-             extra=f"species_keep={len(species_keep)} tree_species={len(tree_species_set)}")
+    log_step(
+        report_lines,
+        "Species ∩ tree tips",
+        0,
+        len(intersect_species),
+        extra=f"species_keep={len(species_keep)} tree_species={len(tree_species_set)}",
+    )
 
     # Prune
     pruned_attempts = 0
@@ -334,25 +408,34 @@ def main():
                 tree.prune(tip)
                 pruned_attempts += 1
             except Exception:
-                # keep going; pruning can fail for edge cases
                 pass
 
     tree_tips_after = tree.count_terminals()
     pruned_tree_path = out_dir / "pruned_tree.newick"
     Phylo.write(tree, pruned_tree_path, "newick")
 
-    log_step(report_lines, "After pruning tree", 0, 0,
-             extra=f"tips_before={tree_tips_before} tips_after={tree_tips_after} pruned={pruned_attempts}")
+    log_step(
+        report_lines,
+        "After pruning tree",
+        0,
+        0,
+        extra=f"tips_before={tree_tips_before} tips_after={tree_tips_after} pruned={pruned_attempts}",
+    )
 
     # --------------------------------------
     # Step 7: Build graph
     # --------------------------------------
     edge_index, edge_attr, leaf_map, node_rows = build_graph_from_tree(tree)
-    log_step(report_lines, "After graph build", 0, 0,
-             extra=f"graph_nodes={len(node_rows)} directed_edges={edge_index.shape[1]} leaf_species={len(leaf_map)}")
+    log_step(
+        report_lines,
+        "After graph build",
+        0,
+        0,
+        extra=f"graph_nodes={len(node_rows)} directed_edges={edge_index.shape[1]} leaf_species={len(leaf_map)}",
+    )
 
     # --------------------------------------
-    # Step 8: Filter sequences to tree leaf map (record dropped seq IDs + species)
+    # Step 8: Filter sequences to tree leaf map
     # --------------------------------------
     leaf_species = set(leaf_map.keys())
 
@@ -362,16 +445,22 @@ def main():
     dropped_seq_ids = sorted(list(seq_ids_before - seq_ids_after))
     drops.add_many("seq_dropped_missing_in_tree_leaf_map", dropped_seq_ids)
 
-    # Also record species that still aren't in leaf map (should largely match missing_species)
     still_missing_species = sorted(list(set(seq_to_species.values()) - leaf_species))
     drops.add_many("species_missing_in_leaf_map_after_prune", still_missing_species)
 
     seqs_final = {sid: seqs_filt[sid] for sid in seq_ids_after}
     seq_to_species_final = {sid: seq_to_species[sid] for sid in seq_ids_after}
+    seq_to_taxonomy_final = {sid: seq_to_taxonomy[sid] for sid in seq_ids_after}
+    seq_to_ranks_final = {sid: seq_to_ranks[sid] for sid in seq_ids_after}
     final_species = set(seq_to_species_final.values())
 
-    log_step(report_lines, "Final (mapped to tree leaves)", len(seqs_final), len(final_species),
-             extra=f"leaf_species={len(leaf_species)}")
+    log_step(
+        report_lines,
+        "Final (mapped to tree leaves)",
+        len(seqs_final),
+        len(final_species),
+        extra=f"leaf_species={len(leaf_species)}",
+    )
 
     # --------------------------------------
     # Write outputs
@@ -389,14 +478,51 @@ def main():
         for sp, nid in sorted(leaf_map.items(), key=lambda x: x[0]):
             f.write(f"{sp}\t{nid}\n")
 
+    # sequences.jsonl now retains taxonomy + ranks
     with open(out_dir / "sequences.jsonl", "w", encoding="utf-8") as f:
         for sid, sp in seq_to_species_final.items():
+            rk = seq_to_ranks_final.get(sid, {})
             f.write(json.dumps({
                 "seq_id": sid,
-                "species": sp,
+                "species": sp,  # normalized Genus_species
                 "node_id": int(leaf_map[sp]),
                 "sequence": seqs_final[sid],
+                "taxonomy": seq_to_taxonomy_final.get(sid),
+                "order": rk.get("order"),
+                "family": rk.get("family"),
+                "genus_raw": rk.get("genus_raw"),
+                "species_raw": rk.get("species_raw"),
             }) + "\n")
+
+    # species_taxonomy.tsv: majority-vote ranks per species (useful for stable coloring)
+    # We compute counts from the final sequences that survived filtering.
+    species_rank_counts = defaultdict(lambda: {"order": Counter(), "family": Counter(), "genus_raw": Counter()})
+    species_seq_counts = Counter()
+
+    for sid, sp in seq_to_species_final.items():
+        rk = seq_to_ranks_final.get(sid, {})
+        species_seq_counts[sp] += 1
+        if rk.get("order"):
+            species_rank_counts[sp]["order"][rk["order"]] += 1
+        if rk.get("family"):
+            species_rank_counts[sp]["family"][rk["family"]] += 1
+        if rk.get("genus_raw"):
+            species_rank_counts[sp]["genus_raw"][rk["genus_raw"]] += 1
+
+    def majority(counter: Counter) -> Tuple[str, int]:
+        if not counter:
+            return ("Unknown", 0)
+        val, cnt = counter.most_common(1)[0]
+        return (val, cnt)
+
+    with open(out_dir / "species_taxonomy.tsv", "w", encoding="utf-8") as f:
+        f.write("species\tseq_count\torder\torder_support\tfamily\tfamily_support\tgenus_raw\tgenus_support\n")
+        for sp in sorted(final_species):
+            seq_count = species_seq_counts[sp]
+            ord_val, ord_sup = majority(species_rank_counts[sp]["order"])
+            fam_val, fam_sup = majority(species_rank_counts[sp]["family"])
+            gen_val, gen_sup = majority(species_rank_counts[sp]["genus_raw"])
+            f.write(f"{sp}\t{seq_count}\t{ord_val}\t{ord_sup}\t{fam_val}\t{fam_sup}\t{gen_val}\t{gen_sup}\n")
 
     # report.txt (summary)
     summary = []
@@ -405,12 +531,13 @@ def main():
     for k, v in drops.most_common():
         summary.append(f"  {k}: {v}")
     summary.append("\nKey output files:")
-    summary.append(f"  pruned_tree.newick: {pruned_tree_path}")
-    summary.append(f"  edge_index.npz:     {out_dir / 'edge_index.npz'}")
-    summary.append(f"  edge_attr.npz:      {out_dir / 'edge_attr.npz'}")
-    summary.append(f"  sequences.jsonl:    {out_dir / 'sequences.jsonl'}")
-    summary.append(f"  leaf_map.tsv:       {out_dir / 'leaf_map.tsv'}")
-    summary.append(f"  nodes.tsv:          {out_dir / 'nodes.tsv'}")
+    summary.append(f"  pruned_tree.newick:      {pruned_tree_path}")
+    summary.append(f"  edge_index.npz:          {out_dir / 'edge_index.npz'}")
+    summary.append(f"  edge_attr.npz:           {out_dir / 'edge_attr.npz'}")
+    summary.append(f"  sequences.jsonl:         {out_dir / 'sequences.jsonl'}")
+    summary.append(f"  species_taxonomy.tsv:    {out_dir / 'species_taxonomy.tsv'}")
+    summary.append(f"  leaf_map.tsv:            {out_dir / 'leaf_map.tsv'}")
+    summary.append(f"  nodes.tsv:               {out_dir / 'nodes.tsv'}")
     (out_dir / "report.txt").write_text("\n".join(summary) + "\n", encoding="utf-8")
 
     # drop_examples.txt (examples)
@@ -428,4 +555,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
