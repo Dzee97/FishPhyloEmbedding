@@ -89,7 +89,7 @@ def load_species_embeddings_from_ckpt(ckpt_path: Path, num_species_expected: int
     return W
 
 
-def scatter_plot_2d(X2, labels, title, outpath, max_classes=25):
+def scatter_plot_2d(X2, labels, title, outpath, max_classes=25, xlabel="dim1", ylabel="dim2"):
     counts = Counter(labels)
     top = set([k for k, _ in counts.most_common(max_classes)])
     labels2 = [lab if lab in top else "Other" for lab in labels]
@@ -100,8 +100,8 @@ def scatter_plot_2d(X2, labels, title, outpath, max_classes=25):
         idx = np.where(np.array(labels2) == u)[0]
         plt.scatter(X2[idx, 0], X2[idx, 1], s=8, alpha=0.7, label=f"{u} (n={len(idx)})")
     plt.title(title)
-    plt.xlabel("dim1")
-    plt.ylabel("dim2")
+    plt.xlabel(xlabel)
+    plt.ylabel(ylabel)
     plt.legend(markerscale=2, fontsize=8, loc="best")
     plt.tight_layout()
     plt.savefig(outpath, dpi=200)
@@ -125,18 +125,24 @@ def main():
     # PCA 2D
     pca2 = PCA(n_components=2, random_state=0)
     X_pca2 = pca2.fit_transform(W)
+    var = pca2.explained_variance_ratio_
+
+    xlabel = f"PC1 ({var[0]*100:.1f}% var)"
+    ylabel = f"PC2 ({var[1]*100:.1f}% var)"
 
     scatter_plot_2d(
         X_pca2, family_labels,
         title="PCA (2D) of species anchor embeddings — colored by Family",
         outpath=args.out_dir / "pca_family.png",
         max_classes=args.max_classes,
+        xlabel=xlabel, ylabel=ylabel
     )
     scatter_plot_2d(
         X_pca2, order_labels,
         title="PCA (2D) of species anchor embeddings — colored by Order",
         outpath=args.out_dir / "pca_order.png",
         max_classes=args.max_classes,
+        xlabel=xlabel, ylabel=ylabel
     )
 
     # UMAP (optional)
