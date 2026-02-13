@@ -3,21 +3,17 @@
 Torch-free preprocessing for Mare-MAGE COI + Fish Tree of Life Newick,
 with detailed drop examples AND taxonomy/rank retention for downstream evaluation.
 
-NEW/CHANGED OUTPUTS:
-  - sequences.jsonl now includes:
-      taxonomy (full string), class, order, family, genus_raw, species_raw
-  - species_taxonomy.tsv (one row per species with majority-vote class/order/family/genus + counts)
-  - iTOL colorstrip datasets keyed by *exact pruned-tree tip names* (works with trinomials):
-      itol_class_colorstrip.txt
-      itol_order_colorstrip.txt
-      itol_family_colorstrip.txt
-
-Existing outputs kept:
+OUTPUTS:
   - pruned_tree.newick
   - edge_index.npz, edge_attr.npz
   - nodes.tsv, leaf_map.tsv
+  - sequences.jsonl  (includes taxonomy, order, family, genus_raw, species_raw)
+  - species_taxonomy.tsv (one row per species with majority-vote order/family/genus + seq_count)
   - report.txt
   - drop_examples.txt
+  - iTOL colorstrip datasets (IDs match EXACT tree tip labels; works with trinomials):
+      itol_order_colorstrip.txt   (legend shows top-10 orders)
+      itol_family_colorstrip.txt  (legend shows top-10 families)
 
 Requires:
   pip install biopython networkx numpy
@@ -73,18 +69,15 @@ def parse_tax_ranks(tax: str) -> dict:
     """
     Extract raw ranks from Mare-MAGE taxonomy string.
     We use:
-      C_...  for class
       O_...  for order
       F_...  for family
       G_...  for genus
       s_...  for species
     """
-    out = {"class": None, "order": None, "family": None, "genus_raw": None, "species_raw": None}
+    out = {"order": None, "family": None, "genus_raw": None, "species_raw": None}
     for part in tax.split(";"):
         part = part.strip()
-        if part.startswith("C_"):
-            out["class"] = part[2:]
-        elif part.startswith("O_"):
+        if part.startswith("O_"):
             out["order"] = part[2:]
         elif part.startswith("F_"):
             out["family"] = part[2:]
@@ -138,8 +131,8 @@ def normalize_species_name(raw: str, collapse_subspecies: bool = True) -> Option
 
 def normalize_tree_tip(name: str, collapse_subspecies: bool = True) -> Optional[str]:
     """
-    Normalize a tree tip name to Genus_species (binomial) by default.
-    This allows matching trinomials in the tree (e.g. "A b b") to binomials ("A_b").
+    Normalize a tree tip to Genus_species (binomial) by default.
+    Tree may contain trinomials; we intentionally collapse for matching.
     """
     if not name:
         return None
@@ -168,26 +161,27 @@ def log_step(lines: list, step: str, n_seq: int, n_sp: int, extra: Optional[str]
 
 
 # ---------------------------
-# iTOL helpers (Colorstrip)
+# iTOL helpers (Colorstrip + legend)
 # ---------------------------
 
 def _hex_color_for_category(cat: str) -> str:
-    """
-    Deterministically map a category string to a hex color.
-    Uses MD5 hash so colors are stable across runs/machines.
-    """
     cat = (cat or "Unknown").strip()
     h = hashlib.md5(cat.encode("utf-8")).hexdigest()
     return f"#{h[:6]}"
 
 
-def write_itol_colorstrip(id_to_group: Dict[str, str], outpath: Path, dataset_label: str) -> None:
+def write_itol_colorstrip_with_legend(
+    id_to_group: Dict[str, str],
+    outpath: Path,
+    dataset_label: str,
+    top_legend_groups: List[str],
+) -> None:
     """
-    Write an iTOL DATASET_COLORSTRIP file:
+    iTOL DATASET_COLORSTRIP:
       <ID> <COLOR> <optional label>
 
-    IMPORTANT: For iTOL, <ID> must match the tree leaf labels EXACTLY.
-    We set the strip color based on group, and use group as the label.
+    Adds a legend containing ONLY `top_legend_groups` (e.g. top 10 orders/families).
+    IDs must match tree leaf labels EXACTLY (including spaces/trinomials).
     """
     lines = []
     lines.append("DATASET_COLORSTRIP")
@@ -195,11 +189,23 @@ def write_itol_colorstrip(id_to_group: Dict[str, str], outpath: Path, dataset_la
     lines.append(f"DATASET_LABEL\t{dataset_label}")
     lines.append("COLOR\t#000000")
     lines.append(f"LEGEND_TITLE\t{dataset_label}")
+    lines.append("COLOR_BRANCHES\t0")
+
+    if top_legend_groups:
+        # Legend entries (squares)
+        legend_colors = [_hex_color_for_category(g) for g in top_legend_groups]
+        legend_shapes = ["1"] * len(top_legend_groups)  # square
+        # For fields with multiple values, iTOL expects space-separated lists even with TAB separator.
+        lines.append("LEGEND_SHAPES\t" + " ".join(legend_shapes))
+        lines.append("LEGEND_COLORS\t" + " ".join(legend_colors))
+        lines.append("LEGEND_LABELS\t" + " ".join([g.replace(" ", "_") for g in top_legend_groups]))
+
     lines.append("DATA")
 
     for node_id, grp in sorted(id_to_group.items(), key=lambda x: x[0]):
         grp = grp if grp and grp.strip() else "Unknown"
         col = _hex_color_for_category(grp)
+        # ID \t color \t label
         lines.append(f"{node_id}\t{col}\t{grp}")
 
     outpath.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -207,17 +213,18 @@ def write_itol_colorstrip(id_to_group: Dict[str, str], outpath: Path, dataset_la
 
 def build_tipname_to_group(tree, species_to_group: Dict[str, str]) -> Dict[str, str]:
     """
-    Map *actual tree tip names* (may include trinomials, spaces, etc.) -> group,
-    by normalizing each tip to a binomial (Genus_species) for lookup in species_to_group.
+    Map *actual tree tip names* -> group, by normalizing tip to binomial for lookup.
 
-    This fixes iTOL errors like "Couldn't find ID Genus_species in the tree" when the
-    tree tip is "Genus species subspecies".
+    This fixes iTOL errors when the tree contains trinomials like:
+      "Aethotaxis mitopteryx mitopteryx"
+    while our species keys are binomials:
+      "Aethotaxis_mitopteryx"
     """
     tip_to_group: Dict[str, str] = {}
     for tip in tree.get_terminals():
         if not tip.name:
             continue
-        norm = normalize_tree_tip(tip.name, collapse_subspecies=True)  # binomial key
+        norm = normalize_tree_tip(tip.name, collapse_subspecies=True)
         if not norm:
             continue
         tip_to_group[tip.name] = species_to_group.get(norm, "Unknown")
@@ -272,8 +279,7 @@ def build_graph_from_tree(tree) -> Tuple[np.ndarray, np.ndarray, Dict[str, int],
         if is_tip:
             name = normalize_tree_tip(clade.name or "", collapse_subspecies=True) or ""
             if name:
-                # If multiple tips collapse to the same binomial, the last one wins.
-                # This matches our species-level modeling choice (binomial resolution).
+                # If multiple tips collapse to the same binomial, last one wins.
                 leaf_map[name] = nid
         node_rows.append((nid, is_tip, name))
 
@@ -306,6 +312,9 @@ def main():
     ap.add_argument("--max_N_frac", type=float, default=0.05)
     ap.add_argument("--require_min_seqs_per_species", type=int, default=2)
     ap.add_argument("--max_examples", type=int, default=20, help="Max examples per drop reason")
+
+    # iTOL legend sizes
+    ap.add_argument("--itol_legend_top", type=int, default=10, help="Top-N groups to show in iTOL legend")
 
     args = ap.parse_args()
 
@@ -475,7 +484,7 @@ def main():
         extra=f"species_keep={len(species_keep)} tree_species={len(tree_species_set)}",
     )
 
-    # Prune (remove tips not in intersect set)
+    # Prune
     pruned_attempts = 0
     for tip, norm in list(tip_norm_map.items()):
         if norm not in intersect_species:
@@ -553,26 +562,23 @@ def main():
         for sp, nid in sorted(leaf_map.items(), key=lambda x: x[0]):
             f.write(f"{sp}\t{nid}\n")
 
-    # sequences.jsonl retains taxonomy + ranks
     with open(out_dir / "sequences.jsonl", "w", encoding="utf-8") as f:
         for sid, sp in seq_to_species_final.items():
             rk = seq_to_ranks_final.get(sid, {})
             f.write(json.dumps({
                 "seq_id": sid,
-                "species": sp,  # normalized Genus_species (binomial)
+                "species": sp,
                 "node_id": int(leaf_map[sp]),
                 "sequence": seqs_final[sid],
                 "taxonomy": seq_to_taxonomy_final.get(sid),
-                "class": rk.get("class"),
                 "order": rk.get("order"),
                 "family": rk.get("family"),
                 "genus_raw": rk.get("genus_raw"),
                 "species_raw": rk.get("species_raw"),
             }) + "\n")
 
-    # species_taxonomy.tsv: majority-vote ranks per species
+    # species_taxonomy.tsv majority-vote ranks per species
     species_rank_counts = defaultdict(lambda: {
-        "class": Counter(),
         "order": Counter(),
         "family": Counter(),
         "genus_raw": Counter(),
@@ -582,8 +588,6 @@ def main():
     for sid, sp in seq_to_species_final.items():
         rk = seq_to_ranks_final.get(sid, {})
         species_seq_counts[sp] += 1
-        if rk.get("class"):
-            species_rank_counts[sp]["class"][rk["class"]] += 1
         if rk.get("order"):
             species_rank_counts[sp]["order"][rk["order"]] += 1
         if rk.get("family"):
@@ -598,63 +602,72 @@ def main():
         return (val, cnt)
 
     with open(out_dir / "species_taxonomy.tsv", "w", encoding="utf-8") as f:
-        f.write("species\tseq_count\tclass\torder\tfamily\tgenus_raw\n")
+        f.write("species\tseq_count\torder\tfamily\tgenus_raw\n")
         for sp in sorted(final_species):
             seq_count = species_seq_counts[sp]
-            cls_val, _ = majority(species_rank_counts[sp]["class"])
             ord_val, _ = majority(species_rank_counts[sp]["order"])
             fam_val, _ = majority(species_rank_counts[sp]["family"])
             gen_val, _ = majority(species_rank_counts[sp]["genus_raw"])
-            f.write(f"{sp}\t{seq_count}\t{cls_val}\t{ord_val}\t{fam_val}\t{gen_val}\n")
+            f.write(f"{sp}\t{seq_count}\t{ord_val}\t{fam_val}\t{gen_val}\n")
 
     # --------------------------------------
-    # iTOL Color Strip datasets — FIXED for trinomial tree tips
+    # iTOL Color Strip datasets (Order/Family) with top-N legend
     # --------------------------------------
-    # Build binomial species -> rank maps
-    species_to_class = {}
     species_to_order = {}
     species_to_family = {}
 
     for sp in sorted(final_species):
         if sp not in leaf_species:
             continue
-        cls_val, _ = majority(species_rank_counts[sp]["class"])
         ord_val, _ = majority(species_rank_counts[sp]["order"])
         fam_val, _ = majority(species_rank_counts[sp]["family"])
-        species_to_class[sp] = cls_val or "Unknown"
         species_to_order[sp] = ord_val or "Unknown"
         species_to_family[sp] = fam_val or "Unknown"
 
-    # Convert to maps keyed by *exact* pruned-tree tip names
-    tip_to_class = build_tipname_to_group(tree, species_to_class)
     tip_to_order = build_tipname_to_group(tree, species_to_order)
     tip_to_family = build_tipname_to_group(tree, species_to_family)
 
-    write_itol_colorstrip(tip_to_class, out_dir / "itol_class_colorstrip.txt", "Class")
-    write_itol_colorstrip(tip_to_order, out_dir / "itol_order_colorstrip.txt", "Order")
-    write_itol_colorstrip(tip_to_family, out_dir / "itol_family_colorstrip.txt", "Family")
+    # Determine top-N legend entries by number of tips in the pruned tree
+    order_counts = Counter(tip_to_order.values())
+    family_counts = Counter(tip_to_family.values())
+    top_orders = [g for g, _ in order_counts.most_common(args.itol_legend_top)]
+    top_families = [g for g, _ in family_counts.most_common(args.itol_legend_top)]
 
-    # report.txt (summary)
+    write_itol_colorstrip_with_legend(
+        tip_to_order,
+        out_dir / "itol_order_colorstrip.txt",
+        "Order",
+        top_orders
+    )
+    write_itol_colorstrip_with_legend(
+        tip_to_family,
+        out_dir / "itol_family_colorstrip.txt",
+        "Family",
+        top_families
+    )
+
+    # report.txt
     summary = []
     summary.extend(report_lines)
     summary.append("\nDrop reasons (counts):")
     for k, v in drops.most_common():
         summary.append(f"  {k}: {v}")
     summary.append("\nKey output files:")
-    summary.append(f"  pruned_tree.newick:         {pruned_tree_path}")
-    summary.append(f"  edge_index.npz:             {out_dir / 'edge_index.npz'}")
-    summary.append(f"  edge_attr.npz:              {out_dir / 'edge_attr.npz'}")
-    summary.append(f"  sequences.jsonl:            {out_dir / 'sequences.jsonl'}")
-    summary.append(f"  species_taxonomy.tsv:       {out_dir / 'species_taxonomy.tsv'}")
-    summary.append(f"  leaf_map.tsv:               {out_dir / 'leaf_map.tsv'}")
-    summary.append(f"  nodes.tsv:                  {out_dir / 'nodes.tsv'}")
-    summary.append(f"  itol_class_colorstrip.txt:  {out_dir / 'itol_class_colorstrip.txt'}")
-    summary.append(f"  itol_order_colorstrip.txt:  {out_dir / 'itol_order_colorstrip.txt'}")
-    summary.append(f"  itol_family_colorstrip.txt: {out_dir / 'itol_family_colorstrip.txt'}")
+    summary.append(f"  pruned_tree.newick:            {pruned_tree_path}")
+    summary.append(f"  edge_index.npz:                {out_dir / 'edge_index.npz'}")
+    summary.append(f"  edge_attr.npz:                 {out_dir / 'edge_attr.npz'}")
+    summary.append(f"  sequences.jsonl:               {out_dir / 'sequences.jsonl'}")
+    summary.append(f"  species_taxonomy.tsv:          {out_dir / 'species_taxonomy.tsv'}")
+    summary.append(f"  leaf_map.tsv:                  {out_dir / 'leaf_map.tsv'}")
+    summary.append(f"  nodes.tsv:                     {out_dir / 'nodes.tsv'}")
+    summary.append(f"  itol_order_colorstrip.txt:     {out_dir / 'itol_order_colorstrip.txt'}")
+    summary.append(f"  itol_family_colorstrip.txt:    {out_dir / 'itol_family_colorstrip.txt'}")
+    summary.append(f"\nTop-{args.itol_legend_top} legend orders: " + ", ".join(top_orders))
+    summary.append(f"Top-{args.itol_legend_top} legend families: " + ", ".join(top_families))
 
     (out_dir / "report.txt").write_text("\n".join(summary) + "\n", encoding="utf-8")
 
-    # drop_examples.txt (examples)
+    # drop_examples.txt
     ex_lines = []
     ex_lines.append(f"Showing up to first {args.max_examples} examples per drop reason.\n")
     for reason, cnt in drops.most_common():

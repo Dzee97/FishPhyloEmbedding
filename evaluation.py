@@ -1,20 +1,16 @@
 #!/usr/bin/env python3
 """
-Evaluation script: PCA + UMAP visualization of learned species anchor embeddings
-with hierarchical taxonomy plots: Class -> Orders-within-class -> Families-within-(class, order).
+Evaluation script: PCA + UMAP visualization of learned species anchor embeddings.
 
 Reads:
 - Training checkpoint (.pt)
-- species_taxonomy.tsv with columns:
-    species, class, order, family  (plus any extra columns)
+- species_taxonomy.tsv for order/family labels
 
 Writes:
-- pca_class.png
-- pca_orders_in_<CLASS>.png
-- pca_families_in_<CLASS>__<ORDER>.png
-- umap_class.png
-- umap_orders_in_<CLASS>.png
-- umap_families_in_<CLASS>__<ORDER>.png
+- pca_order.png  (top orders highlighted; other orders in light gray)
+- pca_families_in_<ORDER>.png for each top order (ALL points; non-target orders in gray)
+- umap_order.png
+- umap_families_in_<ORDER>.png for each top order
 - summary.txt
 
 Dependencies:
@@ -23,7 +19,7 @@ Dependencies:
 
 import argparse
 from pathlib import Path
-from collections import Counter, defaultdict
+from collections import Counter
 import re
 
 import numpy as np
@@ -37,18 +33,16 @@ def read_species_taxonomy_tsv(path: Path):
     """
     Returns:
       species_sorted (list)
-      class_labels (list)
-      order_labels (list)
       family_labels (list)
+      order_labels (list)
     """
     species = []
-    cls = []
-    order = []
     family = []
+    order = []
     with path.open("r", encoding="utf-8") as f:
         header = f.readline().rstrip("\n").split("\t")
         idx = {h: i for i, h in enumerate(header)}
-        required = ["species", "class", "order", "family"]
+        required = ["species", "family", "order"]
         for r in required:
             if r not in idx:
                 raise RuntimeError(f"{path} missing required column: {r}")
@@ -56,23 +50,18 @@ def read_species_taxonomy_tsv(path: Path):
         for line in f:
             parts = line.rstrip("\n").split("\t")
             sp = parts[idx["species"]]
-            c = parts[idx["class"]] or "Unknown"
-            o = parts[idx["order"]] or "Unknown"
-            fam = parts[idx["family"]] or "Unknown"
+            fam = parts[idx["family"]] if parts[idx["family"]] else "Unknown"
+            ord_ = parts[idx["order"]] if parts[idx["order"]] else "Unknown"
             species.append(sp)
-            cls.append(c)
-            order.append(o)
             family.append(fam)
+            order.append(ord_)
 
-    cls_by_sp = dict(zip(species, cls))
     order_by_sp = dict(zip(species, order))
-    fam_by_sp = dict(zip(species, family))
-
+    family_by_sp = dict(zip(species, family))
     species_sorted = sorted(species)
-    class_labels = [cls_by_sp[sp] for sp in species_sorted]
+    family_labels = [family_by_sp[sp] for sp in species_sorted]
     order_labels = [order_by_sp[sp] for sp in species_sorted]
-    family_labels = [fam_by_sp[sp] for sp in species_sorted]
-    return species_sorted, class_labels, order_labels, family_labels
+    return species_sorted, family_labels, order_labels
 
 
 def load_species_embeddings_from_ckpt(ckpt_path: Path, num_species_expected: int):
@@ -114,13 +103,19 @@ def scatter_plot_2d(
     colors=None,
     legend_exclude=None,
 ):
+    """
+    Scatter plot with optional explicit per-point colors.
+
+    - labels: list[str], used to build legend after top-K collapsing
+    - colors: optional list/array of matplotlib colors (len N)
+    - legend_exclude: set of label names to omit from legend (e.g., {"Background"})
+    """
     if legend_exclude is None:
         legend_exclude = set()
 
     counts = Counter(labels)
     top = set([k for k, _ in counts.most_common(max_classes)])
     labels2 = [lab if lab in top else "Other" for lab in labels]
-
     uniq = [u for u in dict.fromkeys(labels2) if u not in legend_exclude]
 
     plt.figure(figsize=(10, 8))
@@ -131,7 +126,7 @@ def scatter_plot_2d(
             idx = np.where(labels2_arr == u)[0]
             plt.scatter(X2[idx, 0], X2[idx, 1], s=8, alpha=0.7, label=f"{u} (n={len(idx)})")
     else:
-        plt.scatter(X2[:, 0], X2[:, 1], s=8, alpha=0.7, c=colors)
+        plt.scatter(X2[:, 0], X2[:, 1], s=8, alpha=0.7, c=colors, linewidths=0)
         for u in uniq:
             idx = np.where(labels2_arr == u)[0]
             if len(idx) == 0:
@@ -148,142 +143,111 @@ def scatter_plot_2d(
     plt.close()
 
 
-def top_k(labels, k):
-    return [x for x, _ in Counter(labels).most_common(k)]
+def top_orders(order_labels, max_orders: int):
+    c = Counter(order_labels)
+    return [o for o, _ in c.most_common(max_orders)]
 
 
-def highlight_categories_plot(
+def highlight_top_orders_plot(
     X2: np.ndarray,
-    labels: list,
+    order_labels: list,
     outpath: Path,
-    top_list: list,
+    top_order_list: list,
     title: str,
-    max_classes: int,
+    max_orders: int,
     xlabel="dim1",
     ylabel="dim2",
     background_color=(0.82, 0.82, 0.82, 0.35),
 ):
-    lab_arr = np.array(labels)
-    top_set = set(top_list)
+    """
+    Show ALL points:
+      - top orders get distinct colors
+      - everything else is "Background" light gray (not in legend)
+    """
+    order_arr = np.array(order_labels)
+    top_set = set(top_order_list)
 
-    plot_labels = ["Background" if l not in top_set else l for l in lab_arr]
+    labels = [o if o in top_set else "Background" for o in order_arr]
 
-    cmap = plt.get_cmap("tab10")
-    cat_to_color = {cat: cmap(i % 10) for i, cat in enumerate(top_list)}
+    cmap = plt.get_cmap("tab20")
+    order_to_color = {o: cmap(i % 20) for i, o in enumerate(top_order_list)}
     bg = background_color
-
-    colors = [bg if l == "Background" else cat_to_color.get(l, (0.2, 0.2, 0.2, 0.9)) for l in plot_labels]
+    colors = [bg if lab == "Background" else order_to_color.get(lab, (0.2, 0.2, 0.2, 0.9)) for lab in labels]
 
     scatter_plot_2d(
-        X2, plot_labels,
+        X2, labels,
         title=title,
         outpath=outpath,
-        max_classes=max_classes + 1,
-        xlabel=xlabel,
-        ylabel=ylabel,
+        max_classes=max_orders + 1,
+        xlabel=xlabel, ylabel=ylabel,
         colors=colors,
         legend_exclude={"Background"},
     )
 
 
-def plot_orders_within_class(
+def per_order_family_plots(
     X2: np.ndarray,
-    class_labels: list,
-    order_labels: list,
-    out_dir: Path,
-    prefix: str,
-    top_classes: list,
-    max_orders_per_class: int,
-    xlabel="dim1",
-    ylabel="dim2",
-):
-    cls_arr = np.array(class_labels)
-    ord_arr = np.array(order_labels)
-
-    for c in top_classes:
-        in_class = (cls_arr == c)
-        orders_in_c = ord_arr[in_class].tolist()
-        top_orders = top_k(orders_in_c, max_orders_per_class)
-
-        outpath = out_dir / f"{prefix}_orders_in_{slugify(c)}.png"
-        # Show all points: highlight top orders inside this class; everything else background
-        labels = []
-        for i in range(len(cls_arr)):
-            if cls_arr[i] == c and ord_arr[i] in set(top_orders):
-                labels.append(ord_arr[i])
-            else:
-                labels.append("Background")
-
-        highlight_categories_plot(
-            X2, labels,
-            outpath=outpath,
-            top_list=top_orders,
-            title=f"{prefix.upper()} — Orders highlighted within class: {c}",
-            max_classes=max_orders_per_class,
-            xlabel=xlabel, ylabel=ylabel,
-        )
-
-
-def plot_families_within_class_order(
-    X2: np.ndarray,
-    class_labels: list,
     order_labels: list,
     family_labels: list,
     out_dir: Path,
     prefix: str,
-    top_classes: list,
-    max_orders_per_class: int,
-    max_families_per_order: int,
-    xlabel="dim1",
-    ylabel="dim2",
+    top_order_list: list,
+    max_families: int,
+    xlabel: str = "dim1",
+    ylabel: str = "dim2",
+    background_color=(0.82, 0.82, 0.82, 0.35),
 ):
-    cls_arr = np.array(class_labels)
-    ord_arr = np.array(order_labels)
-    fam_arr = np.array(family_labels)
+    """
+    For each top order o:
+      - plot ALL points (global context)
+      - points in order o are colored by family (top families within that order)
+      - points outside order o are background gray
+      - legend excludes background points
+    """
+    order_arr = np.array(order_labels)
+    family_arr = np.array(family_labels)
 
-    for c in top_classes:
-        in_class = (cls_arr == c)
-        orders_in_c = ord_arr[in_class].tolist()
-        top_orders = top_k(orders_in_c, max_orders_per_class)
+    cmap = plt.get_cmap("tab20")
 
-        for o in top_orders:
-            in_group = (cls_arr == c) & (ord_arr == o)
-            fams_in_group = fam_arr[in_group].tolist()
-            top_fams = top_k(fams_in_group, max_families_per_order)
-            top_fams_set = set(top_fams)
+    for o in top_order_list:
+        in_order = (order_arr == o)
 
-            labels = []
-            for i in range(len(cls_arr)):
-                if cls_arr[i] == c and ord_arr[i] == o:
-                    f = fam_arr[i]
-                    labels.append(f if f in top_fams_set else "Other")
-                else:
-                    labels.append("Background")
+        # Top families within this order
+        fams_in = family_arr[in_order].tolist()
+        fam_counts = Counter(fams_in)
+        top_fams = [f for f, _ in fam_counts.most_common(max_families)]
+        top_fams_set = set(top_fams)
 
-            outpath = out_dir / f"{prefix}_families_in_{slugify(c)}__{slugify(o)}.png"
+        labels = []
+        for i in range(len(order_arr)):
+            if in_order[i]:
+                f = family_arr[i]
+                labels.append(f if f in top_fams_set else "Other")
+            else:
+                labels.append("Background")
 
-            # Color top families + Other; background excluded from legend
-            cmap = plt.get_cmap("tab10")
-            fam_to_color = {fam: cmap(j % 10) for j, fam in enumerate(top_fams)}
-            fam_to_color["Other"] = (0.35, 0.35, 0.35, 0.9)
-            bg = (0.82, 0.82, 0.82, 0.35)
+        fam_to_color = {fam: cmap(j % 20) for j, fam in enumerate(top_fams)}
+        fam_to_color["Other"] = (0.35, 0.35, 0.35, 0.9)
+        bg = background_color
 
-            colors = []
-            for lab in labels:
-                if lab == "Background":
-                    colors.append(bg)
-                else:
-                    colors.append(fam_to_color.get(lab, fam_to_color["Other"]))
+        colors = []
+        for lab in labels:
+            if lab == "Background":
+                colors.append(bg)
+            else:
+                colors.append(fam_to_color.get(lab, fam_to_color["Other"]))
 
-            scatter_plot_2d(
-                X2, labels,
-                title=f"{prefix.upper()} — Families within (class={c}, order={o})",
-                outpath=outpath,
-                max_classes=max_families_per_order + 2,
-                xlabel=xlabel, ylabel=ylabel,
-                colors=colors,
-                legend_exclude={"Background"},
-            )
+        outpath = out_dir / f"{prefix}_families_in_{slugify(o)}.png"
+        scatter_plot_2d(
+            X2, labels,
+            title=f"{prefix.upper()} — Families highlighted within order: {o}",
+            outpath=outpath,
+            max_classes=max_families + 2,
+            xlabel=xlabel,
+            ylabel=ylabel,
+            colors=colors,
+            legend_exclude={"Background"},
+        )
 
 
 def main():
@@ -294,21 +258,22 @@ def main():
 
     ap.add_argument("--pca_components", type=int, default=80)
 
-    ap.add_argument("--max_classes", type=int, default=6)
-    ap.add_argument("--max_orders_per_class", type=int, default=8)
-    ap.add_argument("--max_families_per_order", type=int, default=10)
+    ap.add_argument("--max_orders", type=int, default=12,
+                    help="Top-N orders to highlight (also generates per-order family plots)")
+    ap.add_argument("--max_families", type=int, default=15,
+                    help="Top-N families to highlight within each selected order")
 
     ap.add_argument("--umap_neighbors", type=int, default=30)
     ap.add_argument("--umap_min_dist", type=float, default=0.2)
     ap.add_argument("--seed", type=int, default=0)
-    args = ap.parse_args()
 
+    args = ap.parse_args()
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
-    species_sorted, class_labels, order_labels, family_labels = read_species_taxonomy_tsv(args.species_taxonomy_tsv)
+    species_sorted, family_labels, order_labels = read_species_taxonomy_tsv(args.species_taxonomy_tsv)
     W = load_species_embeddings_from_ckpt(args.ckpt, num_species_expected=len(species_sorted))
 
-    top_classes = top_k(class_labels, args.max_classes)
+    top_order_list = top_orders(order_labels, args.max_orders)
 
     # --------------------
     # PCA 2D
@@ -319,33 +284,30 @@ def main():
     xlabel = f"PC1 ({var[0]*100:.1f}% var)"
     ylabel = f"PC2 ({var[1]*100:.1f}% var)"
 
-    highlight_categories_plot(
+    highlight_top_orders_plot(
         X_pca2,
-        class_labels,
-        outpath=args.out_dir / "pca_class.png",
-        top_list=top_classes,
-        title="PCA (2D) — Classes highlighted",
-        max_classes=args.max_classes,
-        xlabel=xlabel, ylabel=ylabel,
+        order_labels,
+        outpath=args.out_dir / "pca_order.png",
+        top_order_list=top_order_list,
+        title="PCA (2D) — Top orders highlighted (others in gray)",
+        max_orders=args.max_orders,
+        xlabel=xlabel, ylabel=ylabel
     )
-    plot_orders_within_class(
-        X_pca2, class_labels, order_labels,
-        out_dir=args.out_dir, prefix="pca",
-        top_classes=top_classes,
-        max_orders_per_class=args.max_orders_per_class,
-        xlabel=xlabel, ylabel=ylabel,
-    )
-    plot_families_within_class_order(
-        X_pca2, class_labels, order_labels, family_labels,
-        out_dir=args.out_dir, prefix="pca",
-        top_classes=top_classes,
-        max_orders_per_class=args.max_orders_per_class,
-        max_families_per_order=args.max_families_per_order,
-        xlabel=xlabel, ylabel=ylabel,
+
+    per_order_family_plots(
+        X_pca2,
+        order_labels=order_labels,
+        family_labels=family_labels,
+        out_dir=args.out_dir,
+        prefix="pca",
+        top_order_list=top_order_list,
+        max_families=args.max_families,
+        xlabel=xlabel,
+        ylabel=ylabel,
     )
 
     # --------------------
-    # PCA pre-reduction for UMAP
+    # UMAP
     # --------------------
     pca = PCA(n_components=min(args.pca_components, W.shape[1]), random_state=args.seed)
     Wp = pca.fit_transform(W)
@@ -359,36 +321,32 @@ def main():
     )
     X_umap = reducer.fit_transform(Wp)
 
-    highlight_categories_plot(
+    highlight_top_orders_plot(
         X_umap,
-        class_labels,
-        outpath=args.out_dir / "umap_class.png",
-        top_list=top_classes,
-        title="UMAP — Classes highlighted",
-        max_classes=args.max_classes,
+        order_labels,
+        outpath=args.out_dir / "umap_order.png",
+        top_order_list=top_order_list,
+        title="UMAP — Top orders highlighted (others in gray)",
+        max_orders=args.max_orders,
     )
-    plot_orders_within_class(
-        X_umap, class_labels, order_labels,
-        out_dir=args.out_dir, prefix="umap",
-        top_classes=top_classes,
-        max_orders_per_class=args.max_orders_per_class,
-    )
-    plot_families_within_class_order(
-        X_umap, class_labels, order_labels, family_labels,
-        out_dir=args.out_dir, prefix="umap",
-        top_classes=top_classes,
-        max_orders_per_class=args.max_orders_per_class,
-        max_families_per_order=args.max_families_per_order,
+
+    per_order_family_plots(
+        X_umap,
+        order_labels=order_labels,
+        family_labels=family_labels,
+        out_dir=args.out_dir,
+        prefix="umap",
+        top_order_list=top_order_list,
+        max_families=args.max_families,
     )
 
     (args.out_dir / "summary.txt").write_text(
         "\n".join([
             f"Species plotted: {len(species_sorted)}",
             f"Embedding dim: {W.shape[1]}",
-            f"max_classes: {args.max_classes}",
-            f"max_orders_per_class: {args.max_orders_per_class}",
-            f"max_families_per_order: {args.max_families_per_order}",
-            f"Top classes: {', '.join(top_classes)}",
+            f"max_orders: {args.max_orders}",
+            f"max_families (per order): {args.max_families}",
+            f"Top orders: {', '.join(top_order_list)}",
             f"PCA pre-reduction dims: {min(args.pca_components, W.shape[1])}",
             f"UMAP n_neighbors: {args.umap_neighbors}",
             f"UMAP min_dist: {args.umap_min_dist}",
