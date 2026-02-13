@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Evaluation script: PCA + UMAP visualization of learned species anchor embeddings.
+Evaluation script: PCA + UMAP + t-SNE visualization of learned species anchor embeddings.
 
 Reads:
 - Training checkpoint (.pt) from baseline script
@@ -9,8 +9,10 @@ Reads:
 Writes:
 - pca_order.png
 - pca_families_in_<ORDER>.png for each top order (shows ALL points; non-target orders in gray)
-- umap_order.png (if umap-learn installed)
+- umap_order.png
 - umap_families_in_<ORDER>.png for each top order (shows ALL points; non-target orders in gray)
+- tsne_order.png
+- tsne_families_in_<ORDER>.png for each top order (shows ALL points; non-target orders in gray)
 - summary.txt
 
 Key features:
@@ -19,27 +21,23 @@ Key features:
     --max_families (top families within each selected order)
 - Per-order family plots show all points, but highlight families only within that order.
 - Legend excludes background points.
+- Uses PCA->(UMAP/t-SNE) for speed and stability.
 
 Dependencies:
-  pip install torch numpy scikit-learn matplotlib
-  pip install umap-learn   # optional
+  pip install torch numpy scikit-learn matplotlib umap-learn
 """
 
 import argparse
 from pathlib import Path
-from collections import Counter, defaultdict
+from collections import Counter
 import re
 
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
 from sklearn.decomposition import PCA
-
-try:
-    import umap
-    HAS_UMAP = True
-except Exception:
-    HAS_UMAP = False
+from sklearn.manifold import TSNE
+import umap
 
 
 def read_species_taxonomy_tsv(path: Path):
@@ -131,14 +129,12 @@ def scatter_plot_2d(
     top = set([k for k, _ in counts.most_common(max_classes)])
     labels2 = [lab if lab in top else "Other" for lab in labels]
 
-    # Legend classes in stable order
     uniq = [u for u in dict.fromkeys(labels2) if u not in legend_exclude]
 
     plt.figure(figsize=(10, 8))
     labels2_arr = np.array(labels2)
 
     if colors is None:
-        # Plot per class (easy legend)
         for u in uniq:
             idx = np.where(labels2_arr == u)[0]
             plt.scatter(
@@ -147,20 +143,13 @@ def scatter_plot_2d(
                 label=f"{u} (n={len(idx)})"
             )
     else:
-        # Plot all points once with explicit colors
-        plt.scatter(X2[:, 0], X2[:, 1], s=8, alpha=0.7, c=colors)
-
-        # Add legend handles for classes only (skip excluded labels)
+        plt.scatter(X2[:, 0], X2[:, 1], s=8, alpha=0.7, c=colors, linewidths=0)
         for u in uniq:
             idx = np.where(labels2_arr == u)[0]
             if len(idx) == 0:
                 continue
             col = colors[idx[0]]
-            plt.scatter(
-                [], [], s=30,
-                color=col, alpha=0.9,
-                label=f"{u} (n={len(idx)})"
-            )
+            plt.scatter([], [], s=30, color=col, alpha=0.9, label=f"{u} (n={len(idx)})")
 
     plt.title(title)
     plt.xlabel(xlabel)
@@ -186,7 +175,7 @@ def per_order_family_plots(
     max_families: int,
     xlabel: str = "dim1",
     ylabel: str = "dim2",
-    background_color=(0.82, 0.82, 0.82, 0.35),  # light gray with alpha
+    background_color=(0.82, 0.82, 0.82, 0.35),
 ):
     """
     For each top order o:
@@ -203,13 +192,11 @@ def per_order_family_plots(
     for o in top_order_list:
         in_order = (order_arr == o)
 
-        # Determine top families within this order
         fams_in = family_arr[in_order].tolist()
         fam_counts = Counter(fams_in)
         top_fams = [f for f, _ in fam_counts.most_common(max_families)]
         top_fams_set = set(top_fams)
 
-        # Labels for legend (Background excluded later)
         labels = []
         for i in range(len(order_arr)):
             if in_order[i]:
@@ -218,10 +205,9 @@ def per_order_family_plots(
             else:
                 labels.append("Background")
 
-        # Colors: background gray; inside-order families get tab20 colors; Other = dark gray
         fam_to_color = {}
         for j, fam in enumerate(top_fams):
-            fam_to_color[fam] = cmap(j % 20)
+            fam_to_color[fam] = cmap(j % 10)
         fam_to_color["Other"] = (0.35, 0.35, 0.35, 0.9)
         bg = background_color
 
@@ -237,7 +223,7 @@ def per_order_family_plots(
             X2, labels,
             title=f"{prefix.upper()} — Families highlighted within order: {o}",
             outpath=outpath,
-            max_classes=max_families + 2,  # allow top families + Other + Background (excluded from legend)
+            max_classes=max_families + 2,
             xlabel=xlabel,
             ylabel=ylabel,
             colors=colors,
@@ -251,16 +237,25 @@ def main():
     ap.add_argument("--species_taxonomy_tsv", required=True, type=Path)
     ap.add_argument("--out_dir", required=True, type=Path)
 
-    ap.add_argument("--pca_components", type=int, default=50)
+    # PCA pre-reduction dims used for UMAP and t-SNE
+    ap.add_argument("--pca_components", type=int, default=80)
 
     # Separate caps
-    ap.add_argument("--max_orders", type=int, default=12,
+    ap.add_argument("--max_orders", type=int, default=8,
                     help="Max orders to show (and to generate per-order plots for)")
-    ap.add_argument("--max_families", type=int, default=15, help="Max families to show within each selected order")
+    ap.add_argument("--max_families", type=int, default=10,
+                    help="Max families to show within each selected order")
 
     # UMAP params
     ap.add_argument("--umap_neighbors", type=int, default=30)
     ap.add_argument("--umap_min_dist", type=float, default=0.2)
+
+    # t-SNE params
+    ap.add_argument("--tsne_perplexity", type=float, default=30.0)
+    ap.add_argument("--tsne_learning_rate", type=float, default=200.0)
+    ap.add_argument("--tsne_iterations", type=int, default=1500)
+    ap.add_argument("--tsne_init", type=str, default="pca", choices=["pca", "random"])
+    ap.add_argument("--seed", type=int, default=0)
 
     args = ap.parse_args()
     args.out_dir.mkdir(parents=True, exist_ok=True)
@@ -268,19 +263,17 @@ def main():
     species_sorted, family_labels, order_labels = read_species_taxonomy_tsv(args.species_taxonomy_tsv)
     W = load_species_embeddings_from_ckpt(args.ckpt, num_species_expected=len(species_sorted))
 
-    # Determine top orders once
     top_order_list = top_orders(order_labels, args.max_orders)
 
     # --------------------
-    # PCA 2D
+    # PCA 2D (direct)
     # --------------------
-    pca2 = PCA(n_components=2, random_state=0)
+    pca2 = PCA(n_components=2, random_state=args.seed)
     X_pca2 = pca2.fit_transform(W)
     var = pca2.explained_variance_ratio_
     xlabel = f"PC1 ({var[0]*100:.1f}% var)"
     ylabel = f"PC2 ({var[1]*100:.1f}% var)"
 
-    # Order plot (global)
     scatter_plot_2d(
         X_pca2, order_labels,
         title="PCA (2D) of species anchor embeddings — colored by Order",
@@ -288,8 +281,6 @@ def main():
         max_classes=args.max_orders,
         xlabel=xlabel, ylabel=ylabel
     )
-
-    # Per-order family highlight plots (global points shown)
     per_order_family_plots(
         X_pca2,
         order_labels=order_labels,
@@ -303,52 +294,86 @@ def main():
     )
 
     # --------------------
-    # UMAP (optional)
+    # PCA pre-reduction for UMAP / t-SNE
     # --------------------
-    if HAS_UMAP:
-        pca = PCA(n_components=min(args.pca_components, W.shape[1]), random_state=0)
-        Wp = pca.fit_transform(W)
-        reducer = umap.UMAP(
-            n_neighbors=args.umap_neighbors,
-            min_dist=args.umap_min_dist,
-            n_components=2,
-            metric="cosine",
-            random_state=0
-        )
-        X_umap = reducer.fit_transform(Wp)
+    pca = PCA(n_components=min(args.pca_components, W.shape[1]), random_state=args.seed)
+    Wp = pca.fit_transform(W)
 
-        # Order plot (global)
-        scatter_plot_2d(
-            X_umap, order_labels,
-            title="UMAP of species anchor embeddings — colored by Order",
-            outpath=args.out_dir / "umap_order.png",
-            max_classes=args.max_orders,
-        )
+    # --------------------
+    # UMAP
+    # --------------------
+    reducer = umap.UMAP(
+        n_neighbors=args.umap_neighbors,
+        min_dist=args.umap_min_dist,
+        n_components=2,
+        metric="cosine",
+        random_state=args.seed
+    )
+    X_umap = reducer.fit_transform(Wp)
 
-        # Per-order family highlight plots (global points shown)
-        per_order_family_plots(
-            X_umap,
-            order_labels=order_labels,
-            family_labels=family_labels,
-            out_dir=args.out_dir,
-            prefix="umap",
-            top_order_list=top_order_list,
-            max_families=args.max_families,
-        )
-    else:
-        print("umap-learn not installed; skipping UMAP. Install with: pip install umap-learn")
+    scatter_plot_2d(
+        X_umap, order_labels,
+        title="UMAP of species anchor embeddings — colored by Order",
+        outpath=args.out_dir / "umap_order.png",
+        max_classes=args.max_orders,
+    )
+    per_order_family_plots(
+        X_umap,
+        order_labels=order_labels,
+        family_labels=family_labels,
+        out_dir=args.out_dir,
+        prefix="umap",
+        top_order_list=top_order_list,
+        max_families=args.max_families,
+    )
+
+    # --------------------
+    # t-SNE
+    # --------------------
+    tsne = TSNE(
+        n_components=2,
+        perplexity=args.tsne_perplexity,
+        learning_rate=args.tsne_learning_rate,
+        n_iter=args.tsne_iterations,
+        init=args.tsne_init,
+        random_state=args.seed,
+        metric="euclidean",  # we already PCA-reduced; euclidean is standard for t-SNE here
+        verbose=1,
+    )
+    X_tsne = tsne.fit_transform(Wp)
+
+    scatter_plot_2d(
+        X_tsne, order_labels,
+        title="t-SNE of species anchor embeddings — colored by Order",
+        outpath=args.out_dir / "tsne_order.png",
+        max_classes=args.max_orders,
+    )
+    per_order_family_plots(
+        X_tsne,
+        order_labels=order_labels,
+        family_labels=family_labels,
+        out_dir=args.out_dir,
+        prefix="tsne",
+        top_order_list=top_order_list,
+        max_families=args.max_families,
+    )
 
     # Summary
     (args.out_dir / "summary.txt").write_text(
         "\n".join([
             f"Species plotted: {len(species_sorted)}",
             f"Embedding dim: {W.shape[1]}",
-            f"UMAP available: {HAS_UMAP}",
             f"max_orders: {args.max_orders}",
             f"max_families (per top order): {args.max_families}",
             f"Top orders: {', '.join(top_order_list)}",
+            f"PCA pre-reduction dims: {min(args.pca_components, W.shape[1])}",
             f"UMAP n_neighbors: {args.umap_neighbors}",
             f"UMAP min_dist: {args.umap_min_dist}",
+            f"t-SNE perplexity: {args.tsne_perplexity}",
+            f"t-SNE learning_rate: {args.tsne_learning_rate}",
+            f"t-SNE iterations: {args.tsne_iterations}",
+            f"t-SNE init: {args.tsne_init}",
+            f"seed: {args.seed}",
         ]) + "\n",
         encoding="utf-8"
     )
