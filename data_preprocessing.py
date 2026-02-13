@@ -5,8 +5,12 @@ with detailed drop examples AND taxonomy/rank retention for downstream evaluatio
 
 NEW/CHANGED OUTPUTS:
   - sequences.jsonl now includes:
-      taxonomy (full string), order, family, genus_raw, species_raw
-  - species_taxonomy.tsv (one row per species with majority-vote order/family/genus + counts)
+      taxonomy (full string), class, order, family, genus_raw, species_raw
+  - species_taxonomy.tsv (one row per species with majority-vote class/order/family/genus + counts)
+  - iTOL colorstrip datasets keyed by *exact pruned-tree tip names* (works with trinomials):
+      itol_class_colorstrip.txt
+      itol_order_colorstrip.txt
+      itol_family_colorstrip.txt
 
 Existing outputs kept:
   - pruned_tree.newick
@@ -133,6 +137,10 @@ def normalize_species_name(raw: str, collapse_subspecies: bool = True) -> Option
 
 
 def normalize_tree_tip(name: str, collapse_subspecies: bool = True) -> Optional[str]:
+    """
+    Normalize a tree tip name to Genus_species (binomial) by default.
+    This allows matching trinomials in the tree (e.g. "A b b") to binomials ("A_b").
+    """
     if not name:
         return None
     name = name.strip().strip("'").strip('"').replace("_", " ")
@@ -159,6 +167,10 @@ def log_step(lines: list, step: str, n_seq: int, n_sp: int, extra: Optional[str]
     lines.append(msg)
 
 
+# ---------------------------
+# iTOL helpers (Colorstrip)
+# ---------------------------
+
 def _hex_color_for_category(cat: str) -> str:
     """
     Deterministically map a category string to a hex color.
@@ -166,16 +178,16 @@ def _hex_color_for_category(cat: str) -> str:
     """
     cat = (cat or "Unknown").strip()
     h = hashlib.md5(cat.encode("utf-8")).hexdigest()
-    # Use first 6 hex digits as RGB.
     return f"#{h[:6]}"
 
 
-def write_itol_colorstrip(species_to_group: Dict[str, str], outpath: Path, dataset_label: str) -> None:
+def write_itol_colorstrip(id_to_group: Dict[str, str], outpath: Path, dataset_label: str) -> None:
     """
     Write an iTOL DATASET_COLORSTRIP file:
-      <leaf> <color> <optional label>
+      <ID> <COLOR> <optional label>
 
-    We set the leaf's strip color based on its category, and use the category as the label.
+    IMPORTANT: For iTOL, <ID> must match the tree leaf labels EXACTLY.
+    We set the strip color based on group, and use group as the label.
     """
     lines = []
     lines.append("DATASET_COLORSTRIP")
@@ -185,13 +197,31 @@ def write_itol_colorstrip(species_to_group: Dict[str, str], outpath: Path, datas
     lines.append(f"LEGEND_TITLE\t{dataset_label}")
     lines.append("DATA")
 
-    for sp, grp in sorted(species_to_group.items(), key=lambda x: x[0]):
+    for node_id, grp in sorted(id_to_group.items(), key=lambda x: x[0]):
         grp = grp if grp and grp.strip() else "Unknown"
         col = _hex_color_for_category(grp)
-        # leaf \t color \t label
-        lines.append(f"{sp}\t{col}\t{grp}")
+        lines.append(f"{node_id}\t{col}\t{grp}")
 
     outpath.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def build_tipname_to_group(tree, species_to_group: Dict[str, str]) -> Dict[str, str]:
+    """
+    Map *actual tree tip names* (may include trinomials, spaces, etc.) -> group,
+    by normalizing each tip to a binomial (Genus_species) for lookup in species_to_group.
+
+    This fixes iTOL errors like "Couldn't find ID Genus_species in the tree" when the
+    tree tip is "Genus species subspecies".
+    """
+    tip_to_group: Dict[str, str] = {}
+    for tip in tree.get_terminals():
+        if not tip.name:
+            continue
+        norm = normalize_tree_tip(tip.name, collapse_subspecies=True)  # binomial key
+        if not norm:
+            continue
+        tip_to_group[tip.name] = species_to_group.get(norm, "Unknown")
+    return tip_to_group
 
 
 # ---------------------------
@@ -208,6 +238,10 @@ def iter_terminals_with_norm(tree, collapse_subspecies: bool) -> Dict[Clade, str
 
 
 def build_graph_from_tree(tree) -> Tuple[np.ndarray, np.ndarray, Dict[str, int], list]:
+    """
+    Build an undirected graph from the (pruned) tree.
+    Leaf map keys are binomial Genus_species (normalized). Trinomials collapse to binomials.
+    """
     G = nx.Graph()
     clade_to_id: Dict[Clade, int] = {}
     next_id = 0
@@ -238,6 +272,8 @@ def build_graph_from_tree(tree) -> Tuple[np.ndarray, np.ndarray, Dict[str, int],
         if is_tip:
             name = normalize_tree_tip(clade.name or "", collapse_subspecies=True) or ""
             if name:
+                # If multiple tips collapse to the same binomial, the last one wins.
+                # This matches our species-level modeling choice (binomial resolution).
                 leaf_map[name] = nid
         node_rows.append((nid, is_tip, name))
 
@@ -339,7 +375,6 @@ def main():
     missing_in_fasta = sorted(set(seq_to_species_raw.keys()) - set(seqs_raw.keys()))
     drops.add_many("taxonomy_id_missing_in_fasta", missing_in_fasta)
 
-    # Filter all seq-id keyed dicts to those present in FASTA
     seq_to_species = {sid: sp for sid, sp in seq_to_species_raw.items() if sid in seqs_raw}
     seq_to_taxonomy = {sid: tx for sid, tx in seq_to_taxonomy_raw.items() if sid in seqs_raw}
     seq_to_ranks = {sid: rk for sid, rk in seq_to_ranks_raw.items() if sid in seqs_raw}
@@ -426,7 +461,7 @@ def main():
     )
 
     # --------------------------------------
-    # Step 6: Species ∩ tree tips (record missing species!)
+    # Step 6: Species ∩ tree tips
     # --------------------------------------
     intersect_species = species_keep & tree_species_set
     missing_species = sorted(list(species_keep - tree_species_set))
@@ -440,7 +475,7 @@ def main():
         extra=f"species_keep={len(species_keep)} tree_species={len(tree_species_set)}",
     )
 
-    # Prune
+    # Prune (remove tips not in intersect set)
     pruned_attempts = 0
     for tip, norm in list(tip_norm_map.items()):
         if norm not in intersect_species:
@@ -518,13 +553,13 @@ def main():
         for sp, nid in sorted(leaf_map.items(), key=lambda x: x[0]):
             f.write(f"{sp}\t{nid}\n")
 
-    # sequences.jsonl now retains taxonomy + ranks
+    # sequences.jsonl retains taxonomy + ranks
     with open(out_dir / "sequences.jsonl", "w", encoding="utf-8") as f:
         for sid, sp in seq_to_species_final.items():
             rk = seq_to_ranks_final.get(sid, {})
             f.write(json.dumps({
                 "seq_id": sid,
-                "species": sp,  # normalized Genus_species
+                "species": sp,  # normalized Genus_species (binomial)
                 "node_id": int(leaf_map[sp]),
                 "sequence": seqs_final[sid],
                 "taxonomy": seq_to_taxonomy_final.get(sid),
@@ -535,8 +570,7 @@ def main():
                 "species_raw": rk.get("species_raw"),
             }) + "\n")
 
-    # species_taxonomy.tsv: majority-vote ranks per species (useful for stable coloring)
-    # We compute counts from the final sequences that survived filtering.
+    # species_taxonomy.tsv: majority-vote ranks per species
     species_rank_counts = defaultdict(lambda: {
         "class": Counter(),
         "order": Counter(),
@@ -574,29 +608,31 @@ def main():
             f.write(f"{sp}\t{seq_count}\t{cls_val}\t{ord_val}\t{fam_val}\t{gen_val}\n")
 
     # --------------------------------------
-    # iTOL Color Strip datasets (Option 1)
+    # iTOL Color Strip datasets — FIXED for trinomial tree tips
     # --------------------------------------
-    # Build species -> (class/order/family) maps from the final majority-vote taxonomy table.
-    # These files can be uploaded to iTOL alongside pruned_tree.newick to highlight leaves by rank.
-
+    # Build binomial species -> rank maps
     species_to_class = {}
     species_to_order = {}
     species_to_family = {}
 
     for sp in sorted(final_species):
+        if sp not in leaf_species:
+            continue
         cls_val, _ = majority(species_rank_counts[sp]["class"])
         ord_val, _ = majority(species_rank_counts[sp]["order"])
         fam_val, _ = majority(species_rank_counts[sp]["family"])
+        species_to_class[sp] = cls_val or "Unknown"
+        species_to_order[sp] = ord_val or "Unknown"
+        species_to_family[sp] = fam_val or "Unknown"
 
-        # Only include species that are actually present as leaves after pruning (should be true)
-        if sp in leaf_species:
-            species_to_class[sp] = cls_val or "Unknown"
-            species_to_order[sp] = ord_val or "Unknown"
-            species_to_family[sp] = fam_val or "Unknown"
+    # Convert to maps keyed by *exact* pruned-tree tip names
+    tip_to_class = build_tipname_to_group(tree, species_to_class)
+    tip_to_order = build_tipname_to_group(tree, species_to_order)
+    tip_to_family = build_tipname_to_group(tree, species_to_family)
 
-    write_itol_colorstrip(species_to_class, out_dir / "itol_class_colorstrip.txt", "Class")
-    write_itol_colorstrip(species_to_order, out_dir / "itol_order_colorstrip.txt", "Order")
-    write_itol_colorstrip(species_to_family, out_dir / "itol_family_colorstrip.txt", "Family")
+    write_itol_colorstrip(tip_to_class, out_dir / "itol_class_colorstrip.txt", "Class")
+    write_itol_colorstrip(tip_to_order, out_dir / "itol_order_colorstrip.txt", "Order")
+    write_itol_colorstrip(tip_to_family, out_dir / "itol_family_colorstrip.txt", "Family")
 
     # report.txt (summary)
     summary = []
@@ -605,13 +641,13 @@ def main():
     for k, v in drops.most_common():
         summary.append(f"  {k}: {v}")
     summary.append("\nKey output files:")
-    summary.append(f"  pruned_tree.newick:      {pruned_tree_path}")
-    summary.append(f"  edge_index.npz:          {out_dir / 'edge_index.npz'}")
-    summary.append(f"  edge_attr.npz:           {out_dir / 'edge_attr.npz'}")
-    summary.append(f"  sequences.jsonl:         {out_dir / 'sequences.jsonl'}")
-    summary.append(f"  species_taxonomy.tsv:    {out_dir / 'species_taxonomy.tsv'}")
-    summary.append(f"  leaf_map.tsv:            {out_dir / 'leaf_map.tsv'}")
-    summary.append(f"  nodes.tsv:               {out_dir / 'nodes.tsv'}")
+    summary.append(f"  pruned_tree.newick:         {pruned_tree_path}")
+    summary.append(f"  edge_index.npz:             {out_dir / 'edge_index.npz'}")
+    summary.append(f"  edge_attr.npz:              {out_dir / 'edge_attr.npz'}")
+    summary.append(f"  sequences.jsonl:            {out_dir / 'sequences.jsonl'}")
+    summary.append(f"  species_taxonomy.tsv:       {out_dir / 'species_taxonomy.tsv'}")
+    summary.append(f"  leaf_map.tsv:               {out_dir / 'leaf_map.tsv'}")
+    summary.append(f"  nodes.tsv:                  {out_dir / 'nodes.tsv'}")
     summary.append(f"  itol_class_colorstrip.txt:  {out_dir / 'itol_class_colorstrip.txt'}")
     summary.append(f"  itol_order_colorstrip.txt:  {out_dir / 'itol_order_colorstrip.txt'}")
     summary.append(f"  itol_family_colorstrip.txt: {out_dir / 'itol_family_colorstrip.txt'}")
@@ -625,7 +661,7 @@ def main():
         ex_lines.append(f"{reason} (count={cnt})")
         for ex in drops.examples.get(reason, []):
             ex_lines.append(f"  - {ex}")
-        ex_lines.append("")  # blank line
+        ex_lines.append("")
     (out_dir / "drop_examples.txt").write_text("\n".join(ex_lines), encoding="utf-8")
 
     print("Done. Wrote outputs to:", out_dir)
