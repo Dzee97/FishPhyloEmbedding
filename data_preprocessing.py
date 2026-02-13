@@ -196,9 +196,9 @@ def write_itol_colorstrip_with_legend(
         legend_colors = [_hex_color_for_category(g) for g in top_legend_groups]
         legend_shapes = ["1"] * len(top_legend_groups)  # square
         # For fields with multiple values, iTOL expects space-separated lists even with TAB separator.
-        lines.append("LEGEND_SHAPES\t" + " ".join(legend_shapes))
-        lines.append("LEGEND_COLORS\t" + " ".join(legend_colors))
-        lines.append("LEGEND_LABELS\t" + " ".join([g.replace(" ", "_") for g in top_legend_groups]))
+        lines.append("LEGEND_SHAPES\t" + "\t".join(legend_shapes))
+        lines.append("LEGEND_COLORS\t" + "\t".join(legend_colors))
+        lines.append("LEGEND_LABELS\t" + "\t".join([g.replace(" ", "_") for g in top_legend_groups]))
 
     lines.append("DATA")
 
