@@ -22,6 +22,7 @@ Requires:
 import argparse
 import json
 import re
+import hashlib
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Dict, Optional, List, Tuple
@@ -158,19 +159,23 @@ def log_step(lines: list, step: str, n_seq: int, n_sp: int, extra: Optional[str]
     lines.append(msg)
 
 
+def _hex_color_for_category(cat: str) -> str:
+    """
+    Deterministically map a category string to a hex color.
+    Uses MD5 hash so colors are stable across runs/machines.
+    """
+    cat = (cat or "Unknown").strip()
+    h = hashlib.md5(cat.encode("utf-8")).hexdigest()
+    # Use first 6 hex digits as RGB.
+    return f"#{h[:6]}"
+
+
 def write_itol_colorstrip(species_to_group: Dict[str, str], outpath: Path, dataset_label: str) -> None:
     """
-    Write an iTOL DATASET_COLORSTRIP file mapping leaf names -> category.
-    iTOL will auto-color categories; this keeps the file simple and robust.
+    Write an iTOL DATASET_COLORSTRIP file:
+      <leaf> <color> <optional label>
 
-    Format reference (iTOL):
-      DATASET_COLORSTRIP
-      SEPARATOR TAB
-      DATASET_LABEL <label>
-      COLOR <legend color>
-      LEGEND_TITLE <title>
-      DATA
-      <leaf>\t<category>
+    We set the leaf's strip color based on its category, and use the category as the label.
     """
     lines = []
     lines.append("DATASET_COLORSTRIP")
@@ -180,10 +185,11 @@ def write_itol_colorstrip(species_to_group: Dict[str, str], outpath: Path, datas
     lines.append(f"LEGEND_TITLE\t{dataset_label}")
     lines.append("DATA")
 
-    # Only write species that exist as leaves in the pruned tree
     for sp, grp in sorted(species_to_group.items(), key=lambda x: x[0]):
         grp = grp if grp and grp.strip() else "Unknown"
-        lines.append(f"{sp}\t{grp}")
+        col = _hex_color_for_category(grp)
+        # leaf \t color \t label
+        lines.append(f"{sp}\t{col}\t{grp}")
 
     outpath.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
