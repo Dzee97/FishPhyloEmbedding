@@ -252,7 +252,6 @@ def main():
 
     # t-SNE params
     ap.add_argument("--tsne_perplexity", type=float, default=30.0)
-    ap.add_argument("--tsne_learning_rate", type=float, default=200.0)
     ap.add_argument("--tsne_iterations", type=int, default=1500)
     ap.add_argument("--tsne_init", type=str, default="pca", choices=["pca", "random"])
     ap.add_argument("--seed", type=int, default=0)
@@ -333,8 +332,7 @@ def main():
     tsne = TSNE(
         n_components=2,
         perplexity=args.tsne_perplexity,
-        learning_rate=args.tsne_learning_rate,
-        n_iter=args.tsne_iterations,
+        max_iter=args.tsne_iterations,
         init=args.tsne_init,
         random_state=args.seed,
         metric="euclidean",  # we already PCA-reduced; euclidean is standard for t-SNE here
