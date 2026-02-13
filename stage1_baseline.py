@@ -495,14 +495,14 @@ def main():
     eval_loader = DataLoader(
         dataset,
         batch_sampler=SpeciesBalancedBatchSampler(
-            dataset.indices_by_species, B=args.B, K=args.K, steps_per_epoch=100, seed=args.seed + 123
+            dataset.indices_by_species, B=args.B, K=1, steps_per_epoch=100, seed=args.seed + 123
         ),
         num_workers=max(0, args.num_workers // 2),
         pin_memory=True,
         collate_fn=_collate,
         persistent_workers=False,
     )
-    init_eval = quick_eval_species_retrieval(model, eval_loader, device, temperature=args.temperature, max_batches=20)
+    init_eval = quick_eval_species_retrieval(model, eval_loader, device, temperature=args.temperature)
     print("Initial eval:", init_eval)
     with metrics_path.open("a", encoding="utf-8") as f:
         f.write(json.dumps({"step": step, "epoch": 0, "type": "eval", **init_eval}) + "\n")
@@ -556,7 +556,7 @@ def main():
 
             # Quick eval
             if args.eval_every > 0 and step % args.eval_every == 0:
-                ev = quick_eval_species_retrieval(model, eval_loader, device, temperature=args.temperature, max_batches=30)
+                ev = quick_eval_species_retrieval(model, eval_loader, device, temperature=args.temperature)
                 print("Eval:", ev)
                 with metrics_path.open("a", encoding="utf-8") as f:
                     f.write(json.dumps({"step": step, "epoch": epoch, "type": "eval", **ev}) + "\n")
@@ -577,4 +577,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
