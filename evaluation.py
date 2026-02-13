@@ -140,7 +140,7 @@ def scatter_plot_2d(
                 label=f"{u} (n={len(idx)})"
             )
     else:
-        plt.scatter(X2[:, 0], X2[:, 1], s=8, alpha=0.7, c=colors, linewidths=0)
+        plt.scatter(X2[:, 0], X2[:, 1], s=8, alpha=0.7, c=colors)
         for u in uniq:
             idx = np.where(labels2_arr == u)[0]
             if len(idx) == 0:
