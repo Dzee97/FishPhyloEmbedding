@@ -1,27 +1,25 @@
 #!/usr/bin/env python3
 """
-Evaluation script: PCA + UMAP + t-SNE visualization of learned species anchor embeddings.
+Evaluation script: PCA + UMAP visualization of learned species anchor embeddings.
 
 Reads:
 - Training checkpoint (.pt) from baseline script
 - species_taxonomy.tsv for family/order labels
 
 Writes:
-- pca_order.png
-- pca_families_in_<ORDER>.png for each top order (shows ALL points; non-target orders in gray)
-- umap_order.png
-- umap_families_in_<ORDER>.png for each top order (shows ALL points; non-target orders in gray)
-- tsne_order.png
-- tsne_families_in_<ORDER>.png for each top order (shows ALL points; non-target orders in gray)
+- pca_order.png                      (top orders highlighted; all other orders light gray)
+- pca_families_in_<ORDER>.png         (all points shown; non-target orders in gray; families highlighted within order)
+- umap_order.png                      (top orders highlighted; all other orders light gray)
+- umap_families_in_<ORDER>.png        (all points shown; non-target orders in gray; families highlighted within order)
 - summary.txt
 
 Key features:
 - Separate caps:
-    --max_orders (for order plot + choosing which per-order plots to make)
-    --max_families (top families within each selected order)
+    --max_orders (which orders to highlight + which per-order plots to generate)
+    --max_families (top families to highlight within each selected order)
+- Order plots highlight only top orders; all other orders are shown in light gray (like your family plots).
 - Per-order family plots show all points, but highlight families only within that order.
 - Legend excludes background points.
-- Uses PCA->(UMAP/t-SNE) for speed and stability.
 
 Dependencies:
   pip install torch numpy scikit-learn matplotlib umap-learn
@@ -36,7 +34,6 @@ import numpy as np
 import torch
 import matplotlib.pyplot as plt
 from sklearn.decomposition import PCA
-from sklearn.manifold import TSNE
 import umap
 
 
@@ -165,6 +162,61 @@ def top_orders(order_labels, max_orders: int):
     return [o for o, _ in c.most_common(max_orders)]
 
 
+def plot_orders_highlighted(
+    X2: np.ndarray,
+    order_labels: list,
+    outpath: Path,
+    top_order_list: list,
+    max_orders: int,
+    title: str,
+    xlabel: str = "dim1",
+    ylabel: str = "dim2",
+    background_color=(0.82, 0.82, 0.82, 0.35),
+):
+    """
+    Order plot like the per-family plots:
+      - all points shown
+      - top orders colored
+      - all other orders shown as light gray background
+      - legend excludes background
+    """
+    order_arr = np.array(order_labels)
+
+    top_set = set(top_order_list)
+
+    labels = []
+    for o in order_arr:
+        if o in top_set:
+            labels.append(o)
+        else:
+            labels.append("Background")
+
+    # Distinct colors for top orders
+    cmap = plt.get_cmap("tab10")
+    order_to_color = {}
+    for j, o in enumerate(top_order_list):
+        order_to_color[o] = cmap(j % 10)
+
+    bg = background_color
+    colors = []
+    for lab in labels:
+        if lab == "Background":
+            colors.append(bg)
+        else:
+            colors.append(order_to_color.get(lab, (0.2, 0.2, 0.2, 0.9)))
+
+    scatter_plot_2d(
+        X2, labels,
+        title=title,
+        outpath=outpath,
+        max_classes=max_orders + 1,  # top orders + background
+        xlabel=xlabel,
+        ylabel=ylabel,
+        colors=colors,
+        legend_exclude={"Background"},
+    )
+
+
 def per_order_family_plots(
     X2: np.ndarray,
     order_labels: list,
@@ -237,23 +289,15 @@ def main():
     ap.add_argument("--species_taxonomy_tsv", required=True, type=Path)
     ap.add_argument("--out_dir", required=True, type=Path)
 
-    # PCA pre-reduction dims used for UMAP and t-SNE
-    ap.add_argument("--pca_components", type=int, default=80)
+    ap.add_argument("--pca_components", type=int, default=50)
 
-    # Separate caps
-    ap.add_argument("--max_orders", type=int, default=8,
-                    help="Max orders to show (and to generate per-order plots for)")
-    ap.add_argument("--max_families", type=int, default=10,
+    ap.add_argument("--max_orders", type=int, default=12,
+                    help="Max orders to highlight (and to generate per-order plots for)")
+    ap.add_argument("--max_families", type=int, default=15,
                     help="Max families to show within each selected order")
 
-    # UMAP params
     ap.add_argument("--umap_neighbors", type=int, default=30)
     ap.add_argument("--umap_min_dist", type=float, default=0.2)
-
-    # t-SNE params
-    ap.add_argument("--tsne_perplexity", type=float, default=30.0)
-    ap.add_argument("--tsne_iterations", type=int, default=1500)
-    ap.add_argument("--tsne_init", type=str, default="pca", choices=["pca", "random"])
     ap.add_argument("--seed", type=int, default=0)
 
     args = ap.parse_args()
@@ -265,7 +309,7 @@ def main():
     top_order_list = top_orders(order_labels, args.max_orders)
 
     # --------------------
-    # PCA 2D (direct)
+    # PCA 2D
     # --------------------
     pca2 = PCA(n_components=2, random_state=args.seed)
     X_pca2 = pca2.fit_transform(W)
@@ -273,13 +317,17 @@ def main():
     xlabel = f"PC1 ({var[0]*100:.1f}% var)"
     ylabel = f"PC2 ({var[1]*100:.1f}% var)"
 
-    scatter_plot_2d(
-        X_pca2, order_labels,
-        title="PCA (2D) of species anchor embeddings — colored by Order",
+    plot_orders_highlighted(
+        X_pca2,
+        order_labels=order_labels,
         outpath=args.out_dir / "pca_order.png",
-        max_classes=args.max_orders,
-        xlabel=xlabel, ylabel=ylabel
+        top_order_list=top_order_list,
+        max_orders=args.max_orders,
+        title="PCA (2D) of species anchor embeddings — top Orders highlighted",
+        xlabel=xlabel,
+        ylabel=ylabel,
     )
+
     per_order_family_plots(
         X_pca2,
         order_labels=order_labels,
@@ -293,7 +341,7 @@ def main():
     )
 
     # --------------------
-    # PCA pre-reduction for UMAP / t-SNE
+    # PCA pre-reduction for UMAP
     # --------------------
     pca = PCA(n_components=min(args.pca_components, W.shape[1]), random_state=args.seed)
     Wp = pca.fit_transform(W)
@@ -310,48 +358,21 @@ def main():
     )
     X_umap = reducer.fit_transform(Wp)
 
-    scatter_plot_2d(
-        X_umap, order_labels,
-        title="UMAP of species anchor embeddings — colored by Order",
+    plot_orders_highlighted(
+        X_umap,
+        order_labels=order_labels,
         outpath=args.out_dir / "umap_order.png",
-        max_classes=args.max_orders,
+        top_order_list=top_order_list,
+        max_orders=args.max_orders,
+        title="UMAP of species anchor embeddings — top Orders highlighted",
     )
+
     per_order_family_plots(
         X_umap,
         order_labels=order_labels,
         family_labels=family_labels,
         out_dir=args.out_dir,
         prefix="umap",
-        top_order_list=top_order_list,
-        max_families=args.max_families,
-    )
-
-    # --------------------
-    # t-SNE
-    # --------------------
-    tsne = TSNE(
-        n_components=2,
-        perplexity=args.tsne_perplexity,
-        max_iter=args.tsne_iterations,
-        init=args.tsne_init,
-        random_state=args.seed,
-        metric="euclidean",  # we already PCA-reduced; euclidean is standard for t-SNE here
-        verbose=1,
-    )
-    X_tsne = tsne.fit_transform(Wp)
-
-    scatter_plot_2d(
-        X_tsne, order_labels,
-        title="t-SNE of species anchor embeddings — colored by Order",
-        outpath=args.out_dir / "tsne_order.png",
-        max_classes=args.max_orders,
-    )
-    per_order_family_plots(
-        X_tsne,
-        order_labels=order_labels,
-        family_labels=family_labels,
-        out_dir=args.out_dir,
-        prefix="tsne",
         top_order_list=top_order_list,
         max_families=args.max_families,
     )
@@ -367,10 +388,6 @@ def main():
             f"PCA pre-reduction dims: {min(args.pca_components, W.shape[1])}",
             f"UMAP n_neighbors: {args.umap_neighbors}",
             f"UMAP min_dist: {args.umap_min_dist}",
-            f"t-SNE perplexity: {args.tsne_perplexity}",
-            f"t-SNE learning_rate: {args.tsne_learning_rate}",
-            f"t-SNE iterations: {args.tsne_iterations}",
-            f"t-SNE init: {args.tsne_init}",
             f"seed: {args.seed}",
         ]) + "\n",
         encoding="utf-8"
