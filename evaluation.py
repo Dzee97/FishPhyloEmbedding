@@ -291,7 +291,7 @@ def main():
 
     ap.add_argument("--pca_components", type=int, default=80)
 
-    ap.add_argument("--max_orders", type=int, default=8,
+    ap.add_argument("--max_orders", type=int, default=10,
                     help="Max orders to highlight (and to generate per-order plots for)")
     ap.add_argument("--max_families", type=int, default=10,
                     help="Max families to show within each selected order")
