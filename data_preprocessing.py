@@ -66,16 +66,20 @@ class DropRecorder:
 
 def parse_tax_ranks(tax: str) -> dict:
     """
-    Mare-MAGE taxonomy parts look like:
-      ...;O_Spariformes;F_Sparidae;G_Diplodus;s_Diplodus sargus helenae
-
-    Returns dict with raw (un-normalized) values:
-      order, family, genus_raw, species_raw
+    Extract raw ranks from Mare-MAGE taxonomy string.
+    We use:
+      C_...  for class
+      O_...  for order
+      F_...  for family
+      G_...  for genus
+      s_...  for species
     """
-    out = {"order": None, "family": None, "genus_raw": None, "species_raw": None}
+    out = {"class": None, "order": None, "family": None, "genus_raw": None, "species_raw": None}
     for part in tax.split(";"):
         part = part.strip()
-        if part.startswith("O_"):
+        if part.startswith("C_"):
+            out["class"] = part[2:]
+        elif part.startswith("O_"):
             out["order"] = part[2:]
         elif part.startswith("F_"):
             out["family"] = part[2:]
@@ -152,6 +156,36 @@ def log_step(lines: list, step: str, n_seq: int, n_sp: int, extra: Optional[str]
     if extra:
         msg += f" | {extra}"
     lines.append(msg)
+
+
+def write_itol_colorstrip(species_to_group: Dict[str, str], outpath: Path, dataset_label: str) -> None:
+    """
+    Write an iTOL DATASET_COLORSTRIP file mapping leaf names -> category.
+    iTOL will auto-color categories; this keeps the file simple and robust.
+
+    Format reference (iTOL):
+      DATASET_COLORSTRIP
+      SEPARATOR TAB
+      DATASET_LABEL <label>
+      COLOR <legend color>
+      LEGEND_TITLE <title>
+      DATA
+      <leaf>\t<category>
+    """
+    lines = []
+    lines.append("DATASET_COLORSTRIP")
+    lines.append("SEPARATOR\tTAB")
+    lines.append(f"DATASET_LABEL\t{dataset_label}")
+    lines.append("COLOR\t#000000")
+    lines.append(f"LEGEND_TITLE\t{dataset_label}")
+    lines.append("DATA")
+
+    # Only write species that exist as leaves in the pruned tree
+    for sp, grp in sorted(species_to_group.items(), key=lambda x: x[0]):
+        grp = grp if grp and grp.strip() else "Unknown"
+        lines.append(f"{sp}\t{grp}")
+
+    outpath.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 # ---------------------------
@@ -488,6 +522,7 @@ def main():
                 "node_id": int(leaf_map[sp]),
                 "sequence": seqs_final[sid],
                 "taxonomy": seq_to_taxonomy_final.get(sid),
+                "class": rk.get("class"),
                 "order": rk.get("order"),
                 "family": rk.get("family"),
                 "genus_raw": rk.get("genus_raw"),
@@ -496,12 +531,19 @@ def main():
 
     # species_taxonomy.tsv: majority-vote ranks per species (useful for stable coloring)
     # We compute counts from the final sequences that survived filtering.
-    species_rank_counts = defaultdict(lambda: {"order": Counter(), "family": Counter(), "genus_raw": Counter()})
+    species_rank_counts = defaultdict(lambda: {
+        "class": Counter(),
+        "order": Counter(),
+        "family": Counter(),
+        "genus_raw": Counter(),
+    })
     species_seq_counts = Counter()
 
     for sid, sp in seq_to_species_final.items():
         rk = seq_to_ranks_final.get(sid, {})
         species_seq_counts[sp] += 1
+        if rk.get("class"):
+            species_rank_counts[sp]["class"][rk["class"]] += 1
         if rk.get("order"):
             species_rank_counts[sp]["order"][rk["order"]] += 1
         if rk.get("family"):
@@ -516,13 +558,39 @@ def main():
         return (val, cnt)
 
     with open(out_dir / "species_taxonomy.tsv", "w", encoding="utf-8") as f:
-        f.write("species\tseq_count\torder\torder_support\tfamily\tfamily_support\tgenus_raw\tgenus_support\n")
+        f.write("species\tseq_count\tclass\torder\tfamily\tgenus_raw\n")
         for sp in sorted(final_species):
             seq_count = species_seq_counts[sp]
-            ord_val, ord_sup = majority(species_rank_counts[sp]["order"])
-            fam_val, fam_sup = majority(species_rank_counts[sp]["family"])
-            gen_val, gen_sup = majority(species_rank_counts[sp]["genus_raw"])
-            f.write(f"{sp}\t{seq_count}\t{ord_val}\t{ord_sup}\t{fam_val}\t{fam_sup}\t{gen_val}\t{gen_sup}\n")
+            cls_val, _ = majority(species_rank_counts[sp]["class"])
+            ord_val, _ = majority(species_rank_counts[sp]["order"])
+            fam_val, _ = majority(species_rank_counts[sp]["family"])
+            gen_val, _ = majority(species_rank_counts[sp]["genus_raw"])
+            f.write(f"{sp}\t{seq_count}\t{cls_val}\t{ord_val}\t{fam_val}\t{gen_val}\n")
+
+    # --------------------------------------
+    # iTOL Color Strip datasets (Option 1)
+    # --------------------------------------
+    # Build species -> (class/order/family) maps from the final majority-vote taxonomy table.
+    # These files can be uploaded to iTOL alongside pruned_tree.newick to highlight leaves by rank.
+
+    species_to_class = {}
+    species_to_order = {}
+    species_to_family = {}
+
+    for sp in sorted(final_species):
+        cls_val, _ = majority(species_rank_counts[sp]["class"])
+        ord_val, _ = majority(species_rank_counts[sp]["order"])
+        fam_val, _ = majority(species_rank_counts[sp]["family"])
+
+        # Only include species that are actually present as leaves after pruning (should be true)
+        if sp in leaf_species:
+            species_to_class[sp] = cls_val or "Unknown"
+            species_to_order[sp] = ord_val or "Unknown"
+            species_to_family[sp] = fam_val or "Unknown"
+
+    write_itol_colorstrip(species_to_class, out_dir / "itol_class_colorstrip.txt", "Class")
+    write_itol_colorstrip(species_to_order, out_dir / "itol_order_colorstrip.txt", "Order")
+    write_itol_colorstrip(species_to_family, out_dir / "itol_family_colorstrip.txt", "Family")
 
     # report.txt (summary)
     summary = []
@@ -538,6 +606,10 @@ def main():
     summary.append(f"  species_taxonomy.tsv:    {out_dir / 'species_taxonomy.tsv'}")
     summary.append(f"  leaf_map.tsv:            {out_dir / 'leaf_map.tsv'}")
     summary.append(f"  nodes.tsv:               {out_dir / 'nodes.tsv'}")
+    summary.append(f"  itol_class_colorstrip.txt:  {out_dir / 'itol_class_colorstrip.txt'}")
+    summary.append(f"  itol_order_colorstrip.txt:  {out_dir / 'itol_order_colorstrip.txt'}")
+    summary.append(f"  itol_family_colorstrip.txt: {out_dir / 'itol_family_colorstrip.txt'}")
+
     (out_dir / "report.txt").write_text("\n".join(summary) + "\n", encoding="utf-8")
 
     # drop_examples.txt (examples)
