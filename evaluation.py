@@ -13,6 +13,11 @@ Writes:
 - umap_families_in_<ORDER>.png for each top order
 - summary.txt
 
+NEW quantitative outputs (cosine-based):
+- knn_order_purity.tsv                 (kNN purity per top order + overall)
+- order_intra_cosine_distance.tsv      (compactness per top order)
+- order_pair_cosine_distance.tsv       (pairwise order-to-order distances among top orders)
+
 Dependencies:
   pip install torch numpy scikit-learn matplotlib umap-learn
 """
@@ -26,8 +31,13 @@ import numpy as np
 import torch
 import matplotlib.pyplot as plt
 from sklearn.decomposition import PCA
+from sklearn.neighbors import NearestNeighbors
 import umap
 
+
+# ----------------------------
+# IO: taxonomy + checkpoint
+# ----------------------------
 
 def read_species_taxonomy_tsv(path: Path):
     """
@@ -56,6 +66,7 @@ def read_species_taxonomy_tsv(path: Path):
             family.append(fam)
             order.append(ord_)
 
+    # Stable sorting (matches training script's sorted species list)
     order_by_sp = dict(zip(species, order))
     family_by_sp = dict(zip(species, family))
     species_sorted = sorted(species)
@@ -84,6 +95,10 @@ def load_species_embeddings_from_ckpt(ckpt_path: Path, num_species_expected: int
         )
     return W
 
+
+# ----------------------------
+# Plot helpers
+# ----------------------------
 
 def slugify(s: str) -> str:
     s = s.strip()
@@ -126,7 +141,7 @@ def scatter_plot_2d(
             idx = np.where(labels2_arr == u)[0]
             plt.scatter(X2[idx, 0], X2[idx, 1], s=8, alpha=0.7, label=f"{u} (n={len(idx)})")
     else:
-        plt.scatter(X2[:, 0], X2[:, 1], s=8, alpha=0.7, c=colors, linewidths=0)
+        plt.scatter(X2[:, 0], X2[:, 1], s=8, alpha=0.7, c=colors)
         for u in uniq:
             idx = np.where(labels2_arr == u)[0]
             if len(idx) == 0:
@@ -169,8 +184,8 @@ def highlight_top_orders_plot(
 
     labels = [o if o in top_set else "Background" for o in order_arr]
 
-    cmap = plt.get_cmap("tab20")
-    order_to_color = {o: cmap(i % 20) for i, o in enumerate(top_order_list)}
+    cmap = plt.get_cmap("tab10")
+    order_to_color = {o: cmap(i % 10) for i, o in enumerate(top_order_list)}
     bg = background_color
     colors = [bg if lab == "Background" else order_to_color.get(lab, (0.2, 0.2, 0.2, 0.9)) for lab in labels]
 
@@ -207,12 +222,11 @@ def per_order_family_plots(
     order_arr = np.array(order_labels)
     family_arr = np.array(family_labels)
 
-    cmap = plt.get_cmap("tab20")
+    cmap = plt.get_cmap("tab10")
 
     for o in top_order_list:
         in_order = (order_arr == o)
 
-        # Top families within this order
         fams_in = family_arr[in_order].tolist()
         fam_counts = Counter(fams_in)
         top_fams = [f for f, _ in fam_counts.most_common(max_families)]
@@ -226,7 +240,7 @@ def per_order_family_plots(
             else:
                 labels.append("Background")
 
-        fam_to_color = {fam: cmap(j % 20) for j, fam in enumerate(top_fams)}
+        fam_to_color = {fam: cmap(j % 10) for j, fam in enumerate(top_fams)}
         fam_to_color["Other"] = (0.35, 0.35, 0.35, 0.9)
         bg = background_color
 
@@ -250,6 +264,141 @@ def per_order_family_plots(
         )
 
 
+# ----------------------------
+# Cosine-based metrics
+# ----------------------------
+
+def l2_normalize_rows(X: np.ndarray, eps: float = 1e-12) -> np.ndarray:
+    n = np.linalg.norm(X, axis=1, keepdims=True)
+    n = np.maximum(n, eps)
+    return X / n
+
+
+def knn_order_purity_cosine(
+    X: np.ndarray,
+    order_labels: list,
+    top_orders_list: list,
+    k: int,
+    seed: int = 0,
+):
+    """
+    kNN purity (cosine distance):
+      purity(i) = fraction of k nearest neighbors that share i's order label.
+
+    We report:
+      - overall purity (all points)
+      - per-top-order purity (mean over points in that order)
+      - "Other" purity (mean over non-top orders)
+
+    Uses sklearn NearestNeighbors(metric="cosine") to avoid full NxN distance matrix.
+    """
+    labels = np.array(order_labels)
+    top_set = set(top_orders_list)
+    N = X.shape[0]
+    if k >= N:
+        raise ValueError(f"--knn_k must be < N (got k={k}, N={N})")
+
+    nn = NearestNeighbors(n_neighbors=k + 1, metric="cosine", algorithm="brute")
+    nn.fit(X)
+    neigh_idx = nn.kneighbors(return_distance=False)
+
+    # Remove self neighbor (first col)
+    neigh_idx = neigh_idx[:, 1:]
+
+    neigh_labels = labels[neigh_idx]  # (N, k)
+    same = (neigh_labels == labels[:, None])
+    purity_per_point = same.mean(axis=1)
+
+    overall = float(purity_per_point.mean())
+
+    per_order = {}
+    counts = {}
+    for o in top_orders_list:
+        mask = (labels == o)
+        cnt = int(mask.sum())
+        counts[o] = cnt
+        per_order[o] = float(purity_per_point[mask].mean()) if cnt > 0 else float("nan")
+
+    mask_other = ~np.isin(labels, list(top_set))
+    cnt_other = int(mask_other.sum())
+    counts["Other"] = cnt_other
+    per_order["Other"] = float(purity_per_point[mask_other].mean()) if cnt_other > 0 else float("nan")
+
+    return {
+        "k": int(k),
+        "overall": overall,
+        "per_order": per_order,
+        "counts": counts,
+    }
+
+
+def intra_order_avg_cosine_distance(Xn: np.ndarray, order_labels: list, top_orders_list: list):
+    """
+    Average cosine distance within each top order (compactness).
+
+    For L2-normalized vectors v_i (||v_i||=1):
+      sum_{i<j} v_i·v_j = (||sum v||^2 - n)/2
+
+    average pairwise cosine similarity:
+      avg_sim = (2 * sum_{i<j} dot) / (n(n-1))
+    avg cosine distance:
+      avg_dist = 1 - avg_sim
+
+    Returns dict: order -> (n, avg_dist)
+    """
+    labels = np.array(order_labels)
+    out = {}
+    for o in top_orders_list:
+        idx = np.where(labels == o)[0]
+        n = len(idx)
+        if n < 2:
+            out[o] = (n, float("nan"))
+            continue
+        S = Xn[idx].sum(axis=0)              # sum of unit vectors
+        ss = float(np.dot(S, S))             # ||sum||^2
+        sum_pairs = (ss - n) / 2.0           # sum_{i<j} dot
+        avg_sim = (2.0 * sum_pairs) / (n * (n - 1))
+        avg_dist = 1.0 - avg_sim
+        out[o] = (n, float(avg_dist))
+    return out
+
+
+def inter_order_avg_cosine_distance(Xn: np.ndarray, order_labels: list, top_orders_list: list):
+    """
+    Average cosine distance between each pair of top orders.
+
+    For L2-normalized vectors:
+      avg_sim(A,B) = (sumA · sumB) / (nA nB)
+      avg_dist(A,B) = 1 - avg_sim(A,B)
+
+    Returns list of tuples:
+      (order_a, order_b, nA, nB, avg_dist)
+    """
+    labels = np.array(order_labels)
+    sums = {}
+    counts = {}
+    for o in top_orders_list:
+        idx = np.where(labels == o)[0]
+        counts[o] = int(len(idx))
+        sums[o] = Xn[idx].sum(axis=0) if len(idx) > 0 else None
+
+    rows = []
+    for i, a in enumerate(top_orders_list):
+        for b in top_orders_list[i + 1:]:
+            nA, nB = counts[a], counts[b]
+            if nA == 0 or nB == 0:
+                rows.append((a, b, nA, nB, float("nan")))
+                continue
+            sim = float(np.dot(sums[a], sums[b]) / (nA * nB))
+            dist = 1.0 - sim
+            rows.append((a, b, nA, nB, dist))
+    return rows
+
+
+# ----------------------------
+# Main
+# ----------------------------
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", required=True, type=Path)
@@ -267,6 +416,11 @@ def main():
     ap.add_argument("--umap_min_dist", type=float, default=0.2)
     ap.add_argument("--seed", type=int, default=0)
 
+    # NEW metrics args
+    ap.add_argument("--knn_k", type=int, default=10, help="k for kNN order purity (cosine distance)")
+    ap.add_argument("--metrics_space", choices=["raw", "pca"], default="raw",
+                    help="Compute cosine metrics in raw embedding space or PCA-reduced space (same PCA dims as --pca_components)")
+
     args = ap.parse_args()
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -276,7 +430,7 @@ def main():
     top_order_list = top_orders(order_labels, args.max_orders)
 
     # --------------------
-    # PCA 2D
+    # PCA 2D plots
     # --------------------
     pca2 = PCA(n_components=2, random_state=args.seed)
     X_pca2 = pca2.fit_transform(W)
@@ -307,7 +461,7 @@ def main():
     )
 
     # --------------------
-    # UMAP
+    # UMAP plots (cosine)
     # --------------------
     pca = PCA(n_components=min(args.pca_components, W.shape[1]), random_state=args.seed)
     Wp = pca.fit_transform(W)
@@ -340,6 +494,89 @@ def main():
         max_families=args.max_families,
     )
 
+    # --------------------
+    # Quantitative metrics (cosine)
+    # --------------------
+    if args.metrics_space == "raw":
+        X_metrics = W
+        metrics_space_desc = "raw"
+    else:
+        X_metrics = Wp
+        metrics_space_desc = f"pca{Wp.shape[1]}"
+
+    Xn = l2_normalize_rows(X_metrics)
+
+    # 1) kNN purity
+    knn = knn_order_purity_cosine(
+        Xn,
+        order_labels=order_labels,
+        top_orders_list=top_order_list,
+        k=args.knn_k,
+        seed=args.seed
+    )
+
+    # Write knn_order_purity.tsv
+    knn_path = args.out_dir / "knn_order_purity.tsv"
+    with knn_path.open("w", encoding="utf-8") as f:
+        f.write("order\tcount\tknn_purity_cosine\n")
+        # top orders (in chosen order) then Other
+        for o in top_order_list + ["Other"]:
+            cnt = knn["counts"].get(o, 0)
+            pur = knn["per_order"].get(o, float("nan"))
+            if np.isnan(pur):
+                f.write(f"{o}\t{cnt}\tNA\n")
+            else:
+                f.write(f"{o}\t{cnt}\t{pur:.6f}\n")
+        f.write(f"OVERALL\t{len(order_labels)}\t{knn['overall']:.6f}\n")
+
+    # 2) Intra-order average cosine distance (compactness)
+    intra = intra_order_avg_cosine_distance(Xn, order_labels, top_order_list)
+    intra_path = args.out_dir / "order_intra_cosine_distance.tsv"
+    with intra_path.open("w", encoding="utf-8") as f:
+        f.write("order\tcount\tavg_intra_cosine_distance\n")
+        for o in top_order_list:
+            n, d = intra[o]
+            if np.isnan(d):
+                f.write(f"{o}\t{n}\tNA\n")
+            else:
+                f.write(f"{o}\t{n}\t{d:.6f}\n")
+
+    # 3) Inter-order average cosine distance (pairs)
+    pairs = inter_order_avg_cosine_distance(Xn, order_labels, top_order_list)
+    pair_path = args.out_dir / "order_pair_cosine_distance.tsv"
+    with pair_path.open("w", encoding="utf-8") as f:
+        f.write("order_a\torder_b\tcount_a\tcount_b\tavg_inter_cosine_distance\n")
+        for a, b, nA, nB, d in pairs:
+            if np.isnan(d):
+                f.write(f"{a}\t{b}\t{nA}\t{nB}\tNA\n")
+            else:
+                f.write(f"{a}\t{b}\t{nA}\t{nB}\t{d:.6f}\n")
+
+    # Pretty text summary block
+    def _fmt(x):
+        return "NA" if (x is None or (isinstance(x, float) and np.isnan(x))) else f"{x:.4f}"
+
+    knn_lines = []
+    knn_lines.append(f"kNN purity (cosine), k={args.knn_k}, space={metrics_space_desc}")
+    knn_lines.append(f"overall={knn['overall']:.4f}")
+    # sort by count desc for readability
+    items = sorted([(o, knn["counts"].get(o, 0), knn["per_order"].get(o, np.nan))
+                    for o in top_order_list],
+                   key=lambda t: t[1], reverse=True)
+    for o, cnt, pur in items:
+        knn_lines.append(f"  {o}: n={cnt}, purity={_fmt(pur)}")
+    knn_lines.append(
+        f"  Other: n={knn['counts'].get('Other', 0)}, purity={_fmt(knn['per_order'].get('Other', np.nan))}")
+
+    intra_lines = []
+    intra_lines.append(f"Intra-order avg cosine distance (compactness), space={metrics_space_desc}")
+    items2 = sorted([(o, intra[o][0], intra[o][1]) for o in top_order_list], key=lambda t: t[1], reverse=True)
+    for o, cnt, d in items2:
+        intra_lines.append(f"  {o}: n={cnt}, avg_intra_dist={_fmt(d)}")
+
+    # --------------------
+    # summary.txt
+    # --------------------
     (args.out_dir / "summary.txt").write_text(
         "\n".join([
             f"Species plotted: {len(species_sorted)}",
@@ -351,11 +588,26 @@ def main():
             f"UMAP n_neighbors: {args.umap_neighbors}",
             f"UMAP min_dist: {args.umap_min_dist}",
             f"seed: {args.seed}",
+            "",
+            f"Metrics space: {metrics_space_desc}",
+            f"knn_k: {args.knn_k}",
+            "",
+            *knn_lines,
+            "",
+            *intra_lines,
+            "",
+            "Files written:",
+            f"  {knn_path.name}",
+            f"  {intra_path.name}",
+            f"  {pair_path.name}",
         ]) + "\n",
         encoding="utf-8"
     )
 
-    print("Wrote plots to:", args.out_dir)
+    print("Wrote plots + metrics to:", args.out_dir)
+    print(f"- {knn_path.name}")
+    print(f"- {intra_path.name}")
+    print(f"- {pair_path.name}")
 
 
 if __name__ == "__main__":
