@@ -14,9 +14,14 @@ Writes:
 - summary.txt
 
 Quantitative outputs (cosine-based):
-- knn_order_purity.tsv
-- order_knn_intra_cosine_distance.tsv
-- order_pair_separation.tsv   (centroid cosine dist + dispersion-normalized separation)
+1) knn_order_purity.tsv
+2) order_knn_intra_cosine_distance.tsv
+3) order_pair_separation.tsv
+   - centroid_cosine_dist: 1 - dot(cA, cB)
+   - sigma2_a / sigma2_b: mean( (1 - x·c)^2 ) within each order
+   - separation_effect: centroid_cosine_dist / sqrt(sigma2_a + sigma2_b)
+4) order_pair_knn_margin.tsv   <-- NEW (kNN inter-order margin)
+   - measures local neighborhood overlap between order pairs using the same kNN graph
 
 Dependencies:
   pip install torch numpy scikit-learn matplotlib umap-learn
@@ -286,8 +291,7 @@ def build_knn_indices_cosine(Xn: np.ndarray, k: int):
     nn = NearestNeighbors(n_neighbors=k + 1, metric="cosine", algorithm="brute")
     nn.fit(Xn)
     neigh_idx = nn.kneighbors(return_distance=False)
-    # Remove self (first col)
-    neigh_idx = neigh_idx[:, 1:]
+    neigh_idx = neigh_idx[:, 1:]  # drop self
     return neigh_idx
 
 
@@ -296,11 +300,6 @@ def knn_order_purity_from_indices(order_labels: list, neigh_idx: np.ndarray, top
     kNN purity (cosine distance), using precomputed neighbor indices.
 
     purity(i) = fraction of k neighbors that share i's order label.
-
-    Reports:
-      - overall purity (all points)
-      - per-top-order purity (mean over points in that order)
-      - "Other" purity (mean over non-top orders)
     """
     labels = np.array(order_labels)
     top_set = set(top_orders_list)
@@ -344,33 +343,19 @@ def knn_restricted_intra_order_cosine_distance(
       - consider its k nearest neighbors
       - keep only neighbors with SAME order label
       - compute mean cosine distance to those (1 - dot)
-      - if no same-order neighbors, mark as NaN for that point
-
-    Then for each top order:
-      - average over points in that order that have >=1 same-order neighbor
-
-    Returns:
-      dict order -> {
-        "n_points": int,
-        "n_points_with_inorder_neighbors": int,
-        "avg_knn_intra_cosine_distance": float (NaN if none)
-      }
+      - if no same-order neighbors, mark as NaN
     """
     labels = np.array(order_labels)
     top_set = set(top_orders_list)
 
-    # dot products with neighbors (since Xn rows are unit vectors)
-    # For each i, neighbor dots = Xn[i] · Xn[j]
-    # cosine distance = 1 - dot
-    Xi = Xn[:, None, :]                        # (N, 1, D)
-    Xj = Xn[neigh_idx]                         # (N, k, D)
-    dots = np.sum(Xi * Xj, axis=2)             # (N, k)
-    dists = 1.0 - dots                         # (N, k)
+    Xi = Xn[:, None, :]        # (N, 1, D)
+    Xj = Xn[neigh_idx]         # (N, k, D)
+    dots = np.sum(Xi * Xj, axis=2)
+    dists = 1.0 - dots
 
-    neigh_labels = labels[neigh_idx]           # (N, k)
+    neigh_labels = labels[neigh_idx]
     same_mask = (neigh_labels == labels[:, None])
 
-    # mean distance to same-order neighbors per point
     out_per_point = np.full((Xn.shape[0],), np.nan, dtype=np.float64)
     for i in range(Xn.shape[0]):
         m = same_mask[i]
@@ -391,7 +376,6 @@ def knn_restricted_intra_order_cosine_distance(
             "avg_knn_intra_cosine_distance": avg,
         }
 
-    # Other (optional but useful)
     mask_other = ~np.isin(labels, list(top_set))
     n_points = int(mask_other.sum())
     vals = out_per_point[mask_other]
@@ -412,11 +396,6 @@ def order_centroids_and_dispersion(Xn: np.ndarray, order_labels: list, orders: l
     For each order:
       - centroid direction c (unit vector) from sum of unit vectors
       - dispersion sigma2 = mean( (cosine_distance(x, c))^2 ) = mean( (1 - x·c)^2 )
-
-    Returns:
-      centroids: dict order -> unit centroid (D,)
-      sigma2:    dict order -> float
-      counts:    dict order -> int
     """
     labels = np.array(order_labels)
     centroids = {}
@@ -435,15 +414,13 @@ def order_centroids_and_dispersion(Xn: np.ndarray, order_labels: list, orders: l
         S = Xn[idx].sum(axis=0)
         normS = float(np.linalg.norm(S))
         if normS < eps:
-            # extremely unlikely unless vectors cancel perfectly
             c = S * 0.0
         else:
             c = S / normS
 
         centroids[o] = c
-
-        dots = Xn[idx] @ c  # (n,)
-        d = 1.0 - dots      # cosine distance to centroid
+        dots = Xn[idx] @ c
+        d = 1.0 - dots
         sigma2[o] = float(np.mean(d * d))
 
     return centroids, sigma2, counts
@@ -459,11 +436,6 @@ def inter_order_separation_effect_size(
       - centroid cosine distance: d = 1 - cA·cB
       - dispersion-normalized separation:
           sep = d / sqrt(sigma2_A + sigma2_B)
-
-    where sigma2 is mean squared cosine distance to centroid within each order.
-
-    Returns list of tuples:
-      (order_a, order_b, nA, nB, centroid_cosine_dist, sigma2_A, sigma2_B, sep_effect)
     """
     centroids, sigma2, counts = order_centroids_and_dispersion(Xn, order_labels, top_orders_list)
 
@@ -479,6 +451,85 @@ def inter_order_separation_effect_size(
             denom = float(np.sqrt(max(1e-12, sigma2[a] + sigma2[b])))
             sep = dist / denom
             rows.append((a, b, nA, nB, dist, sigma2[a], sigma2[b], sep))
+    return rows
+
+
+def knn_inter_order_margin(
+    Xn: np.ndarray,
+    order_labels: list,
+    neigh_idx: np.ndarray,
+    top_orders_list: list,
+):
+    """
+    NEW (5th measure): kNN inter-order margin.
+
+    For a directed comparison A -> B:
+
+      For each point i in order A:
+        - d_AA(i): mean cosine distance to neighbors within kNN that are ALSO in order A
+        - d_AB(i): mean cosine distance to neighbors within kNN that are in order B
+        - delta(i) = d_AB(i) - d_AA(i)
+
+      margin(A->B) = mean delta(i) over i where both sets exist.
+
+    We also report:
+      - support: number of points used in that average
+      - symmetric margin: 0.5*(margin(A->B) + margin(B->A))
+
+    Interpretation:
+      - large positive symmetric margin => the two orders avoid each other locally
+      - near 0 => lots of local overlap/mixing
+      - negative => unusual (B is locally closer than A for many A points)
+    """
+    labels = np.array(order_labels)
+    top_set = set(top_orders_list)
+
+    # Precompute cosine distances to each point's kNN using dot product (Xn are unit vectors)
+    Xi = Xn[:, None, :]          # (N, 1, D)
+    Xj = Xn[neigh_idx]           # (N, k, D)
+    dots = np.sum(Xi * Xj, axis=2)
+    dists = 1.0 - dots           # (N, k)
+
+    neigh_labels = labels[neigh_idx]  # (N, k)
+
+    def directed_margin(a: str, b: str):
+        mask_a = (labels == a)
+        idx_a = np.where(mask_a)[0]
+        if idx_a.size == 0:
+            return float("nan"), 0
+
+        deltas = []
+        for i in idx_a:
+            lab_nei = neigh_labels[i]
+            dist_nei = dists[i]
+
+            m_A = (lab_nei == a)
+            m_B = (lab_nei == b)
+
+            # Need at least one same-order neighbor and one B neighbor within kNN
+            if (not np.any(m_A)) or (not np.any(m_B)):
+                continue
+
+            d_aa = float(dist_nei[m_A].mean())
+            d_ab = float(dist_nei[m_B].mean())
+            deltas.append(d_ab - d_aa)
+
+        if len(deltas) == 0:
+            return float("nan"), 0
+        return float(np.mean(deltas)), int(len(deltas))
+
+    rows = []
+    for i, a in enumerate(top_orders_list):
+        for b in top_orders_list[i + 1:]:
+            m_ab, n_ab = directed_margin(a, b)
+            m_ba, n_ba = directed_margin(b, a)
+
+            if np.isnan(m_ab) or np.isnan(m_ba):
+                sym = float("nan")
+            else:
+                sym = 0.5 * (m_ab + m_ba)
+
+            rows.append((a, b, m_ab, n_ab, m_ba, n_ba, sym))
     return rows
 
 
@@ -593,12 +644,10 @@ def main():
 
     Xn = l2_normalize_rows(X_metrics)
 
-    # Shared kNN indices for all kNN-based metrics
     neigh_idx = build_knn_indices_cosine(Xn, k=args.knn_k)
 
     # 1) kNN purity
     knn = knn_order_purity_from_indices(order_labels, neigh_idx, top_order_list)
-
     knn_path = args.out_dir / "knn_order_purity.tsv"
     with knn_path.open("w", encoding="utf-8") as f:
         f.write("order\tcount\tknn_purity_cosine\n")
@@ -615,7 +664,6 @@ def main():
     intra_knn = knn_restricted_intra_order_cosine_distance(
         Xn, order_labels, neigh_idx, top_order_list
     )
-
     intra_path = args.out_dir / "order_knn_intra_cosine_distance.tsv"
     with intra_path.open("w", encoding="utf-8") as f:
         f.write("order\tn_points\tn_points_with_inorder_neighbors\tavg_knn_intra_cosine_distance\n")
@@ -627,9 +675,8 @@ def main():
             else:
                 f.write(f"{o}\t{rec['n_points']}\t{rec['n_points_with_inorder_neighbors']}\t{avg:.6f}\n")
 
-    # 3) Inter-order separation effect size (centroid dist normalized by dispersion)
+    # 3+4) Centroid distance + centroid-based separation effect size
     pairs = inter_order_separation_effect_size(Xn, order_labels, top_order_list)
-
     pair_path = args.out_dir / "order_pair_separation.tsv"
     with pair_path.open("w", encoding="utf-8") as f:
         f.write("order_a\torder_b\tcount_a\tcount_b\tcentroid_cosine_dist\tsigma2_a\tsigma2_b\tseparation_effect\n")
@@ -638,6 +685,16 @@ def main():
                 f.write(f"{a}\t{b}\t{nA}\t{nB}\tNA\t{s2a:.6g}\t{s2b:.6g}\tNA\n")
             else:
                 f.write(f"{a}\t{b}\t{nA}\t{nB}\t{dist:.6f}\t{s2a:.6g}\t{s2b:.6g}\t{sep:.6f}\n")
+
+    # 5) NEW: kNN inter-order margin (local overlap / mixing)
+    knn_pairs = knn_inter_order_margin(Xn, order_labels, neigh_idx, top_order_list)
+    knn_pair_path = args.out_dir / "order_pair_knn_margin.tsv"
+    with knn_pair_path.open("w", encoding="utf-8") as f:
+        f.write("order_a\torder_b\tmargin_a_to_b\tcount_a_used\tmargin_b_to_a\tcount_b_used\tsymmetric_margin\n")
+        for a, b, m_ab, n_ab, m_ba, n_ba, sym in knn_pairs:
+            def fmt(x):
+                return "NA" if (x is None or (isinstance(x, float) and np.isnan(x))) else f"{x:.6f}"
+            f.write(f"{a}\t{b}\t{fmt(m_ab)}\t{n_ab}\t{fmt(m_ba)}\t{n_ba}\t{fmt(sym)}\n")
 
     # --------------------
     # summary.txt
@@ -660,29 +717,34 @@ def main():
         f"Metrics space: {metrics_space_desc}",
         f"kNN k: {args.knn_k}",
         "",
-        "kNN order purity (cosine):",
+        "1) kNN order purity (cosine):",
         f"  overall={knn['overall']:.4f}",
     ]
-    # list per-order purity sorted by count desc
+
     items = sorted([(o, knn["counts"][o], knn["per_order"][o]) for o in top_order_list],
                    key=lambda t: t[1], reverse=True)
     for o, cnt, pur in items:
         lines.append(f"  {o}: n={cnt}, purity={_fmt(pur)}")
     lines.append(f"  Other: n={knn['counts'].get('Other', 0)}, purity={_fmt(knn['per_order'].get('Other', np.nan))}")
 
-    lines += ["", "kNN-restricted intra-order cosine distance (lower = tighter):"]
+    lines += ["", "2) kNN-restricted intra-order cosine distance (lower = tighter):"]
     items2 = sorted([(o, intra_knn[o]["n_points"], intra_knn[o]["avg_knn_intra_cosine_distance"]) for o in top_order_list],
                     key=lambda t: t[1], reverse=True)
     for o, cnt, d in items2:
         lines.append(f"  {o}: n={cnt}, avg_knn_intra_dist={_fmt(d)}")
     lines.append(
-        f"  Other: n={intra_knn['Other']['n_points']}, avg_knn_intra_dist={_fmt(intra_knn['Other']['avg_knn_intra_cosine_distance'])}")
+        f"  Other: n={intra_knn['Other']['n_points']}, avg_knn_intra_dist={_fmt(intra_knn['Other']['avg_knn_intra_cosine_distance'])}"
+    )
 
-    lines += ["", "Inter-order separation effect size (higher = more separated vs spread):"]
-    # show top 10 pairs by effect size
+    lines += ["", "3+4) Centroid-based separation effect size (higher = more separated vs spread):"]
     pairs_sorted = sorted([p for p in pairs if not np.isnan(p[-1])], key=lambda t: t[-1], reverse=True)
     for a, b, nA, nB, dist, s2a, s2b, sep in pairs_sorted[:10]:
         lines.append(f"  {a} vs {b}: centroid_dist={dist:.4f}, sep_effect={sep:.4f}")
+
+    lines += ["", "5) kNN inter-order margin (symmetric; higher = less local mixing):"]
+    knn_pairs_sorted = sorted([p for p in knn_pairs if not np.isnan(p[-1])], key=lambda t: t[-1], reverse=True)
+    for a, b, m_ab, n_ab, m_ba, n_ba, sym in knn_pairs_sorted[:10]:
+        lines.append(f"  {a} vs {b}: sym_margin={sym:.4f} (A->B={_fmt(m_ab)}, nA={n_ab}; B->A={_fmt(m_ba)}, nB={n_ba})")
 
     lines += [
         "",
@@ -690,6 +752,7 @@ def main():
         f"  {knn_path.name}",
         f"  {intra_path.name}",
         f"  {pair_path.name}",
+        f"  {knn_pair_path.name}",
     ]
 
     (args.out_dir / "summary.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -698,6 +761,7 @@ def main():
     print(f"- {knn_path.name}")
     print(f"- {intra_path.name}")
     print(f"- {pair_path.name}")
+    print(f"- {knn_pair_path.name}")
 
 
 if __name__ == "__main__":
