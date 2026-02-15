@@ -504,7 +504,7 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
 
     # Metrics args
-    ap.add_argument("--knn_k", type=int, default=50, help="k for kNN metrics (cosine distance)")
+    ap.add_argument("--knn_k", type=int, default=20, help="k for kNN metrics (cosine distance)")
     ap.add_argument("--metrics_space", choices=["raw", "pca"], default="raw",
                     help="Compute cosine metrics in raw embedding space or PCA-reduced space (same PCA dims as --pca_components)")
 
