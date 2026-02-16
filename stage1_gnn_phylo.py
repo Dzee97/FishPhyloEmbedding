@@ -334,7 +334,7 @@ def main():
     ap.add_argument("--dropout", type=float, default=0.1)
 
     # Sampling + loss
-    ap.add_argument("--batch_anchors", type=int, default=512, help="anchors per step (leaf nodes)")
+    ap.add_argument("--batch_anchors", type=int, default=256, help="anchors per step (leaf nodes)")
     ap.add_argument("--pos_walk_len", type=int, default=2, help="random walk length to sample positives")
     ap.add_argument("--neg_exclusion_hops", type=int, default=3, help="negatives must be outside this hop radius")
     ap.add_argument("--margin", type=float, default=0.2)
@@ -342,7 +342,7 @@ def main():
     # Training
     ap.add_argument("--epochs", type=int, default=20)
     ap.add_argument("--steps_per_epoch", type=int, default=2000)
-    ap.add_argument("--lr", type=float, default=3e-3)
+    ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--weight_decay", type=float, default=1e-4)
     ap.add_argument("--grad_clip", type=float, default=1.0)
 
