@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Evaluation script: PCA + UMAP visualization of learned species anchor embeddings.
+Evaluation script: PCA + UMAP visualization of learned species embeddings.
 
 Reads:
-- Training checkpoint (.pt)
+- Training checkpoint (.pt) (baseline or GNN)
 - species_taxonomy.tsv for order/family labels
 
 Writes:
@@ -17,11 +17,7 @@ Quantitative outputs (cosine-based):
 1) knn_order_purity.tsv
 2) order_knn_intra_cosine_distance.tsv
 3) order_pair_separation.tsv
-   - centroid_cosine_dist: 1 - dot(cA, cB)
-   - sigma2_a / sigma2_b: mean( (1 - x·c)^2 ) within each order
-   - separation_effect: centroid_cosine_dist / sqrt(sigma2_a + sigma2_b)
-4) order_pair_knn_margin.tsv   <-- NEW (kNN inter-order margin)
-   - measures local neighborhood overlap between order pairs using the same kNN graph
+4) order_pair_knn_margin.tsv
 
 Dependencies:
   pip install torch numpy scikit-learn matplotlib umap-learn
@@ -71,7 +67,6 @@ def read_species_taxonomy_tsv(path: Path):
             family.append(fam)
             order.append(ord_)
 
-    # Stable sorting (matches training script's sorted species list)
     order_by_sp = dict(zip(species, order))
     family_by_sp = dict(zip(species, family))
     species_sorted = sorted(species)
@@ -80,17 +75,44 @@ def read_species_taxonomy_tsv(path: Path):
     return species_sorted, family_labels, order_labels
 
 
-def load_species_embeddings_from_ckpt(ckpt_path: Path, num_species_expected: int):
-    ckpt = torch.load(str(ckpt_path), map_location="cpu")
-    sd = ckpt["model"]
+def load_species_embeddings_from_ckpt(ckpt_path: Path, num_species_expected: int) -> np.ndarray:
+    """
+    Checkpoint-agnostic loader.
 
+    Supports:
+    - Baseline CLIP checkpoint: ckpt["model"] contains ... species_emb.weight
+    - GNN checkpoint: ckpt has ckpt["species_embeddings"] (preferred)
+    """
+    ckpt = torch.load(str(ckpt_path), map_location="cpu")
+
+    # 1) Preferred: explicit tensor
+    if "species_embeddings" in ckpt:
+        W = ckpt["species_embeddings"]
+        if isinstance(W, np.ndarray):
+            W = torch.from_numpy(W)
+        W = W.detach().cpu().numpy()
+        if W.shape[0] != num_species_expected:
+            raise RuntimeError(
+                f"Checkpoint has species_embeddings with {W.shape[0]} rows but labels file has {num_species_expected}. "
+                f"Are you using the same filtered dataset?"
+            )
+        return W
+
+    # 2) Backward-compatible: look in state_dict
+    if "model" not in ckpt:
+        raise RuntimeError("Checkpoint has no 'species_embeddings' and no 'model' state_dict.")
+
+    sd = ckpt["model"]
     key = None
     for k in sd.keys():
         if k.endswith("species_emb.weight"):
             key = k
             break
     if key is None:
-        raise RuntimeError("Could not find species_emb.weight in checkpoint state_dict keys.")
+        raise RuntimeError(
+            "Could not find species embeddings in checkpoint. "
+            "Expected ckpt['species_embeddings'] or a state_dict key ending with 'species_emb.weight'."
+        )
 
     W = sd[key].detach().cpu().numpy()
     if W.shape[0] != num_species_expected:
@@ -112,6 +134,11 @@ def slugify(s: str) -> str:
     return s[:80] if len(s) > 80 else s
 
 
+def top_orders(order_labels, max_orders: int):
+    c = Counter(order_labels)
+    return [o for o, _ in c.most_common(max_orders)]
+
+
 def scatter_plot_2d(
     X2,
     labels,
@@ -123,21 +150,14 @@ def scatter_plot_2d(
     colors=None,
     legend_exclude=None,
 ):
-    """
-    Scatter plot with optional explicit per-point colors.
-
-    - labels: list[str], used to build legend after top-K collapsing
-    - colors: optional list/array of matplotlib colors (len N)
-    - legend_exclude: set of label names to omit from legend (e.g., {"Background"})
-    """
     if legend_exclude is None:
         legend_exclude = set()
 
     counts = Counter(labels)
     top = set([k for k, _ in counts.most_common(max_classes)])
     labels2 = [lab if lab in top else "Other" for lab in labels]
-    uniq = [u for u in dict.fromkeys(labels2) if u not in legend_exclude]
 
+    uniq = [u for u in dict.fromkeys(labels2) if u not in legend_exclude]
     plt.figure(figsize=(10, 8))
     labels2_arr = np.array(labels2)
 
@@ -163,11 +183,6 @@ def scatter_plot_2d(
     plt.close()
 
 
-def top_orders(order_labels, max_orders: int):
-    c = Counter(order_labels)
-    return [o for o, _ in c.most_common(max_orders)]
-
-
 def highlight_top_orders_plot(
     X2: np.ndarray,
     order_labels: list,
@@ -175,30 +190,33 @@ def highlight_top_orders_plot(
     top_order_list: list,
     title: str,
     max_orders: int,
-    xlabel="dim1",
-    ylabel="dim2",
+    xlabel: str = "dim1",
+    ylabel: str = "dim2",
     background_color=(0.82, 0.82, 0.82, 0.35),
 ):
-    """
-    Show ALL points:
-      - top orders get distinct colors
-      - everything else is "Background" light gray (not in legend)
-    """
     order_arr = np.array(order_labels)
     top_set = set(top_order_list)
 
-    labels = [o if o in top_set else "Background" for o in order_arr]
+    labels = []
+    for o in order_arr:
+        labels.append(o if o in top_set else "Background")
 
     cmap = plt.get_cmap("tab10")
     order_to_color = {o: cmap(i % 10) for i, o in enumerate(top_order_list)}
     bg = background_color
-    colors = [bg if lab == "Background" else order_to_color.get(lab, (0.2, 0.2, 0.2, 0.9)) for lab in labels]
+
+    colors = []
+    for lab in labels:
+        if lab == "Background":
+            colors.append(bg)
+        else:
+            colors.append(order_to_color.get(lab, (0.2, 0.2, 0.2, 0.9)))
 
     scatter_plot_2d(
         X2, labels,
         title=title,
         outpath=outpath,
-        max_classes=max_orders + 1,
+        max_classes=max_orders + 2,
         xlabel=xlabel, ylabel=ylabel,
         colors=colors,
         legend_exclude={"Background"},
@@ -217,13 +235,6 @@ def per_order_family_plots(
     ylabel: str = "dim2",
     background_color=(0.82, 0.82, 0.82, 0.35),
 ):
-    """
-    For each top order o:
-      - plot ALL points (global context)
-      - points in order o are colored by family (top families within that order)
-      - points outside order o are background gray
-      - legend excludes background points
-    """
     order_arr = np.array(order_labels)
     family_arr = np.array(family_labels)
 
@@ -245,7 +256,9 @@ def per_order_family_plots(
             else:
                 labels.append("Background")
 
-        fam_to_color = {fam: cmap(j % 10) for j, fam in enumerate(top_fams)}
+        fam_to_color = {}
+        for j, fam in enumerate(top_fams):
+            fam_to_color[fam] = cmap(j % 10)
         fam_to_color["Other"] = (0.35, 0.35, 0.35, 0.9)
         bg = background_color
 
@@ -270,267 +283,173 @@ def per_order_family_plots(
 
 
 # ----------------------------
-# Cosine-based metrics
+# Cosine kNN + metrics
 # ----------------------------
 
 def l2_normalize_rows(X: np.ndarray, eps: float = 1e-12) -> np.ndarray:
     n = np.linalg.norm(X, axis=1, keepdims=True)
-    n = np.maximum(n, eps)
-    return X / n
+    return X / np.clip(n, eps, None)
 
 
-def build_knn_indices_cosine(Xn: np.ndarray, k: int):
+def build_knn_indices_cosine(Xn: np.ndarray, k: int) -> np.ndarray:
     """
-    Returns neighbor indices of shape (N, k) using cosine distance on L2-normalized vectors.
-    Excludes self neighbor automatically.
+    Returns neighbor indices excluding self.
+    Uses cosine distance (equivalent to 1 - dot for normalized vectors).
     """
-    N = Xn.shape[0]
-    if k >= N:
-        raise ValueError(f"k must be < N (got k={k}, N={N})")
-
-    nn = NearestNeighbors(n_neighbors=k + 1, metric="cosine", algorithm="brute")
+    nn = NearestNeighbors(n_neighbors=k + 1, metric="cosine")
     nn.fit(Xn)
-    neigh_idx = nn.kneighbors(return_distance=False)
-    neigh_idx = neigh_idx[:, 1:]  # drop self
-    return neigh_idx
+    _, idx = nn.kneighbors(Xn, return_distance=True)
+    return idx[:, 1:]  # drop self
 
 
-def knn_order_purity_from_indices(order_labels: list, neigh_idx: np.ndarray, top_orders_list: list):
-    """
-    kNN purity (cosine distance), using precomputed neighbor indices.
+def knn_order_purity_from_indices(order_labels: list, neigh_idx: np.ndarray, top_order_list: list) -> dict:
+    order_arr = np.array(order_labels)
+    top_set = set(top_order_list)
 
-    purity(i) = fraction of k neighbors that share i's order label.
-    """
-    labels = np.array(order_labels)
-    top_set = set(top_orders_list)
-    neigh_labels = labels[neigh_idx]  # (N, k)
-    same = (neigh_labels == labels[:, None])
-    purity_per_point = same.mean(axis=1)
+    mapped = np.array([o if o in top_set else "Other" for o in order_arr], dtype=object)
 
-    overall = float(purity_per_point.mean())
+    per_order_hits = Counter()
+    per_order_total = Counter()
+
+    for i in range(len(mapped)):
+        o = mapped[i]
+        nbrs = mapped[neigh_idx[i]]
+        hits = int((nbrs == o).sum())
+        per_order_hits[o] += hits
+        per_order_total[o] += len(nbrs)
 
     per_order = {}
-    counts = {}
-    for o in top_orders_list:
-        mask = (labels == o)
-        cnt = int(mask.sum())
-        counts[o] = cnt
-        per_order[o] = float(purity_per_point[mask].mean()) if cnt > 0 else float("nan")
+    for o in per_order_total:
+        per_order[o] = per_order_hits[o] / max(1, per_order_total[o])
 
-    mask_other = ~np.isin(labels, list(top_set))
-    cnt_other = int(mask_other.sum())
-    counts["Other"] = cnt_other
-    per_order["Other"] = float(purity_per_point[mask_other].mean()) if cnt_other > 0 else float("nan")
+    overall = sum(per_order_hits.values()) / max(1, sum(per_order_total.values()))
+    counts = Counter(mapped.tolist())
 
-    return {
-        "k": int(neigh_idx.shape[1]),
-        "overall": overall,
-        "per_order": per_order,
-        "counts": counts,
-    }
+    return {"overall": overall, "per_order": per_order, "counts": counts}
 
 
-def knn_restricted_intra_order_cosine_distance(
-    Xn: np.ndarray,
-    order_labels: list,
-    neigh_idx: np.ndarray,
-    top_orders_list: list,
-):
-    """
-    kNN-restricted intra-order cosine distance:
+def knn_restricted_intra_order_cosine_distance(Xn: np.ndarray, order_labels: list, neigh_idx: np.ndarray, top_order_list: list) -> dict:
+    order_arr = np.array(order_labels)
+    top_set = set(top_order_list)
+    mapped = np.array([o if o in top_set else "Other" for o in order_arr], dtype=object)
 
-    For each point i:
-      - consider its k nearest neighbors
-      - keep only neighbors with SAME order label
-      - compute mean cosine distance to those (1 - dot)
-      - if no same-order neighbors, mark as NaN
-    """
-    labels = np.array(order_labels)
-    top_set = set(top_orders_list)
-
-    Xi = Xn[:, None, :]        # (N, 1, D)
-    Xj = Xn[neigh_idx]         # (N, k, D)
-    dots = np.sum(Xi * Xj, axis=2)
-    dists = 1.0 - dots
-
-    neigh_labels = labels[neigh_idx]
-    same_mask = (neigh_labels == labels[:, None])
-
-    out_per_point = np.full((Xn.shape[0],), np.nan, dtype=np.float64)
-    for i in range(Xn.shape[0]):
-        m = same_mask[i]
-        if np.any(m):
-            out_per_point[i] = float(dists[i, m].mean())
-
-    results = {}
-    for o in top_orders_list:
-        mask_o = (labels == o)
-        n_points = int(mask_o.sum())
-        vals = out_per_point[mask_o]
-        valid = ~np.isnan(vals)
-        n_valid = int(valid.sum())
-        avg = float(vals[valid].mean()) if n_valid > 0 else float("nan")
-        results[o] = {
-            "n_points": n_points,
-            "n_points_with_inorder_neighbors": n_valid,
-            "avg_knn_intra_cosine_distance": avg,
-        }
-
-    mask_other = ~np.isin(labels, list(top_set))
-    n_points = int(mask_other.sum())
-    vals = out_per_point[mask_other]
-    valid = ~np.isnan(vals)
-    n_valid = int(valid.sum())
-    avg = float(vals[valid].mean()) if n_valid > 0 else float("nan")
-    results["Other"] = {
-        "n_points": n_points,
-        "n_points_with_inorder_neighbors": n_valid,
-        "avg_knn_intra_cosine_distance": avg,
-    }
-
-    return results
-
-
-def order_centroids_and_dispersion(Xn: np.ndarray, order_labels: list, orders: list, eps: float = 1e-12):
-    """
-    For each order:
-      - centroid direction c (unit vector) from sum of unit vectors
-      - dispersion sigma2 = mean( (cosine_distance(x, c))^2 ) = mean( (1 - x·c)^2 )
-    """
-    labels = np.array(order_labels)
-    centroids = {}
-    sigma2 = {}
-    counts = {}
-
-    for o in orders:
-        idx = np.where(labels == o)[0]
-        n = int(len(idx))
-        counts[o] = n
-        if n == 0:
-            centroids[o] = None
-            sigma2[o] = float("nan")
+    out = {}
+    for o in list(top_order_list) + ["Other"]:
+        mask = (mapped == o)
+        idxs = np.where(mask)[0]
+        if len(idxs) == 0:
+            out[o] = {"n_points": 0, "avg_knn_intra_cosine_distance": float("nan")}
             continue
 
-        S = Xn[idx].sum(axis=0)
-        normS = float(np.linalg.norm(S))
-        if normS < eps:
-            c = S * 0.0
-        else:
-            c = S / normS
+        dists = []
+        for i in idxs:
+            nbrs = neigh_idx[i]
+            nbrs_same = [j for j in nbrs if mapped[j] == o]
+            if not nbrs_same:
+                continue
+            # cosine dist = 1 - dot, since Xn rows are normalized
+            dots = (Xn[i] * Xn[nbrs_same]).sum(axis=1)
+            dists.append(float(np.mean(1.0 - dots)))
+        out[o] = {
+            "n_points": int(len(idxs)),
+            "avg_knn_intra_cosine_distance": float(np.mean(dists)) if dists else float("nan"),
+        }
+    return out
 
+
+def order_pair_separation_effect(Xn: np.ndarray, order_labels: list, top_order_list: list) -> List[Tuple[str, str, float, float, float, float]]:
+    """
+    Pair separation based on centroid distance normalized by within-order dispersion:
+      centroid_cosine_dist = 1 - dot(cA, cB)
+      sigma2_A = mean( (1 - dot(x, cA))^2 ) over x in A
+      separation_effect = centroid_cosine_dist / sqrt(sigma2_A + sigma2_B)
+    """
+    order_arr = np.array(order_labels)
+    top_set = set(top_order_list)
+    mapped = np.array([o if o in top_set else "Other" for o in order_arr], dtype=object)
+
+    # compute centroids
+    centroids = {}
+    sig2 = {}
+    for o in list(top_order_list) + ["Other"]:
+        idxs = np.where(mapped == o)[0]
+        if len(idxs) == 0:
+            centroids[o] = None
+            sig2[o] = float("nan")
+            continue
+        c = Xn[idxs].mean(axis=0)
+        c = c / max(1e-12, np.linalg.norm(c))
         centroids[o] = c
-        dots = Xn[idx] @ c
+
+        dots = (Xn[idxs] * c).sum(axis=1)
         d = 1.0 - dots
-        sigma2[o] = float(np.mean(d * d))
+        sig2[o] = float(np.mean(d ** 2))
 
-    return centroids, sigma2, counts
-
-
-def inter_order_separation_effect_size(
-    Xn: np.ndarray,
-    order_labels: list,
-    top_orders_list: list,
-):
-    """
-    For each pair (A,B) among top orders:
-      - centroid cosine distance: d = 1 - cA·cB
-      - dispersion-normalized separation:
-          sep = d / sqrt(sigma2_A + sigma2_B)
-    """
-    centroids, sigma2, counts = order_centroids_and_dispersion(Xn, order_labels, top_orders_list)
-
-    rows = []
-    for i, a in enumerate(top_orders_list):
-        for b in top_orders_list[i + 1:]:
-            nA, nB = counts[a], counts[b]
+    orders = list(top_order_list) + ["Other"]
+    pairs = []
+    for i in range(len(orders)):
+        for j in range(i + 1, len(orders)):
+            a, b = orders[i], orders[j]
+            if centroids[a] is None or centroids[b] is None:
+                continue
             cA, cB = centroids[a], centroids[b]
-            if cA is None or cB is None or nA == 0 or nB == 0:
-                rows.append((a, b, nA, nB, float("nan"), sigma2[a], sigma2[b], float("nan")))
-                continue
-            dist = 1.0 - float(np.dot(cA, cB))
-            denom = float(np.sqrt(max(1e-12, sigma2[a] + sigma2[b])))
-            sep = dist / denom
-            rows.append((a, b, nA, nB, dist, sigma2[a], sigma2[b], sep))
-    return rows
+            centroid_cos_dist = float(1.0 - float(np.dot(cA, cB)))
+            sA, sB = sig2[a], sig2[b]
+            denom = math.sqrt(max(1e-12, sA + sB)) if (not np.isnan(sA) and not np.isnan(sB)) else float("nan")
+            eff = float(centroid_cos_dist / denom) if denom == denom else float("nan")
+            pairs.append((a, b, centroid_cos_dist, float(sA), float(sB), eff))
+    return pairs
 
 
-def knn_inter_order_margin(
-    Xn: np.ndarray,
-    order_labels: list,
-    neigh_idx: np.ndarray,
-    top_orders_list: list,
-):
+def knn_inter_order_margin(Xn: np.ndarray, order_labels: list, neigh_idx: np.ndarray, top_order_list: list):
     """
-    NEW (5th measure): kNN inter-order margin.
-
-    For a directed comparison A -> B:
-
-      For each point i in order A:
-        - d_AA(i): mean cosine distance to neighbors within kNN that are ALSO in order A
-        - d_AB(i): mean cosine distance to neighbors within kNN that are in order B
-        - delta(i) = d_AB(i) - d_AA(i)
-
-      margin(A->B) = mean delta(i) over i where both sets exist.
-
-    We also report:
-      - support: number of points used in that average
-      - symmetric margin: 0.5*(margin(A->B) + margin(B->A))
-
-    Interpretation:
-      - large positive symmetric margin => the two orders avoid each other locally
-      - near 0 => lots of local overlap/mixing
-      - negative => unusual (B is locally closer than A for many A points)
+    Local overlap / mixing between order pairs based on kNN neighborhoods.
+    For each pair (A,B):
+      margin A->B = mean_over_i_in_A [ mean_cos_dist(i, N_B(i)) - mean_cos_dist(i, N_A(i)) ]
+    where N_B(i) are neighbors of i that belong to B (if any), N_A(i) those in A.
     """
-    labels = np.array(order_labels)
-    top_set = set(top_orders_list)
+    order_arr = np.array(order_labels)
+    top_set = set(top_order_list)
+    mapped = np.array([o if o in top_set else "Other" for o in order_arr], dtype=object)
 
-    # Precompute cosine distances to each point's kNN using dot product (Xn are unit vectors)
-    Xi = Xn[:, None, :]          # (N, 1, D)
-    Xj = Xn[neigh_idx]           # (N, k, D)
-    dots = np.sum(Xi * Xj, axis=2)
-    dists = 1.0 - dots           # (N, k)
+    orders = list(top_order_list) + ["Other"]
+    out = []
 
-    neigh_labels = labels[neigh_idx]  # (N, k)
-
-    def directed_margin(a: str, b: str):
-        mask_a = (labels == a)
-        idx_a = np.where(mask_a)[0]
-        if idx_a.size == 0:
-            return float("nan"), 0
-
-        deltas = []
-        for i in idx_a:
-            lab_nei = neigh_labels[i]
-            dist_nei = dists[i]
-
-            m_A = (lab_nei == a)
-            m_B = (lab_nei == b)
-
-            # Need at least one same-order neighbor and one B neighbor within kNN
-            if (not np.any(m_A)) or (not np.any(m_B)):
+    # precompute dot products for neighbor retrieval quickly
+    # cosine dist = 1 - dot for normalized rows
+    for ia in range(len(orders)):
+        for ib in range(ia + 1, len(orders)):
+            A = orders[ia]
+            B = orders[ib]
+            idxA = np.where(mapped == A)[0]
+            idxB = np.where(mapped == B)[0]
+            if len(idxA) == 0 or len(idxB) == 0:
                 continue
 
-            d_aa = float(dist_nei[m_A].mean())
-            d_ab = float(dist_nei[m_B].mean())
-            deltas.append(d_ab - d_aa)
+            def margin_one_way(src_order, tgt_order):
+                idxS = np.where(mapped == src_order)[0]
+                margins = []
+                used = 0
+                for i in idxS:
+                    nbrs = neigh_idx[i]
+                    n_same = [j for j in nbrs if mapped[j] == src_order]
+                    n_tgt = [j for j in nbrs if mapped[j] == tgt_order]
+                    if not n_same or not n_tgt:
+                        continue
+                    used += 1
+                    dot_same = (Xn[i] * Xn[n_same]).sum(axis=1)
+                    dot_tgt = (Xn[i] * Xn[n_tgt]).sum(axis=1)
+                    d_same = 1.0 - dot_same
+                    d_tgt = 1.0 - dot_tgt
+                    margins.append(float(np.mean(d_tgt) - float(np.mean(d_same))))
+                return (float(np.mean(margins)) if margins else float("nan"), used)
 
-        if len(deltas) == 0:
-            return float("nan"), 0
-        return float(np.mean(deltas)), int(len(deltas))
+            m_ab, n_ab = margin_one_way(A, B)
+            m_ba, n_ba = margin_one_way(B, A)
+            sym = float(np.nanmean([m_ab, m_ba]))
+            out.append((A, B, m_ab, n_ab, m_ba, n_ba, sym))
 
-    rows = []
-    for i, a in enumerate(top_orders_list):
-        for b in top_orders_list[i + 1:]:
-            m_ab, n_ab = directed_margin(a, b)
-            m_ba, n_ba = directed_margin(b, a)
-
-            if np.isnan(m_ab) or np.isnan(m_ba):
-                sym = float("nan")
-            else:
-                sym = 0.5 * (m_ab + m_ba)
-
-            rows.append((a, b, m_ab, n_ab, m_ba, n_ba, sym))
-    return rows
+    return out
 
 
 # ----------------------------
@@ -543,21 +462,19 @@ def main():
     ap.add_argument("--species_taxonomy_tsv", required=True, type=Path)
     ap.add_argument("--out_dir", required=True, type=Path)
 
-    ap.add_argument("--pca_components", type=int, default=80)
+    ap.add_argument("--seed", type=int, default=0)
 
-    ap.add_argument("--max_orders", type=int, default=12,
-                    help="Top-N orders to highlight (also generates per-order family plots)")
-    ap.add_argument("--max_families", type=int, default=15,
-                    help="Top-N families to highlight within each selected order")
+    ap.add_argument("--pca_components", type=int, default=50)
+
+    ap.add_argument("--max_orders", type=int, default=12)
+    ap.add_argument("--max_families", type=int, default=15)
 
     ap.add_argument("--umap_neighbors", type=int, default=30)
     ap.add_argument("--umap_min_dist", type=float, default=0.2)
-    ap.add_argument("--seed", type=int, default=0)
 
-    # Metrics args
     ap.add_argument("--knn_k", type=int, default=10, help="k for kNN metrics (cosine distance)")
     ap.add_argument("--metrics_space", choices=["raw", "pca"], default="raw",
-                    help="Compute cosine metrics in raw embedding space or PCA-reduced space (same PCA dims as --pca_components)")
+                    help="Compute cosine metrics in raw embedding space or PCA-reduced space (same dims as --pca_components)")
 
     args = ap.parse_args()
     args.out_dir.mkdir(parents=True, exist_ok=True)
@@ -650,43 +567,30 @@ def main():
     knn = knn_order_purity_from_indices(order_labels, neigh_idx, top_order_list)
     knn_path = args.out_dir / "knn_order_purity.tsv"
     with knn_path.open("w", encoding="utf-8") as f:
-        f.write("order\tcount\tknn_purity_cosine\n")
-        for o in top_order_list + ["Other"]:
-            cnt = knn["counts"].get(o, 0)
-            pur = knn["per_order"].get(o, float("nan"))
-            if np.isnan(pur):
-                f.write(f"{o}\t{cnt}\tNA\n")
-            else:
-                f.write(f"{o}\t{cnt}\t{pur:.6f}\n")
+        f.write("order\tn_species\tknn_purity\n")
+        for o in top_order_list:
+            f.write(f"{o}\t{knn['counts'][o]}\t{knn['per_order'].get(o, float('nan')):.6f}\n")
+        f.write(f"Other\t{knn['counts'].get('Other', 0)}\t{knn['per_order'].get('Other', float('nan')):.6f}\n")
         f.write(f"OVERALL\t{len(order_labels)}\t{knn['overall']:.6f}\n")
 
-    # 2) kNN-restricted intra-order cosine distance
-    intra_knn = knn_restricted_intra_order_cosine_distance(
-        Xn, order_labels, neigh_idx, top_order_list
-    )
+    # 2) kNN intra-order distance
+    intra_knn = knn_restricted_intra_order_cosine_distance(Xn, order_labels, neigh_idx, top_order_list)
     intra_path = args.out_dir / "order_knn_intra_cosine_distance.tsv"
     with intra_path.open("w", encoding="utf-8") as f:
-        f.write("order\tn_points\tn_points_with_inorder_neighbors\tavg_knn_intra_cosine_distance\n")
-        for o in top_order_list + ["Other"]:
-            rec = intra_knn[o]
-            avg = rec["avg_knn_intra_cosine_distance"]
-            if np.isnan(avg):
-                f.write(f"{o}\t{rec['n_points']}\t{rec['n_points_with_inorder_neighbors']}\tNA\n")
-            else:
-                f.write(f"{o}\t{rec['n_points']}\t{rec['n_points_with_inorder_neighbors']}\t{avg:.6f}\n")
+        f.write("order\tn_points\tavg_knn_intra_cosine_distance\n")
+        for o in top_order_list:
+            f.write(f"{o}\t{intra_knn[o]['n_points']}\t{intra_knn[o]['avg_knn_intra_cosine_distance']:.6f}\n")
+        f.write(f"Other\t{intra_knn['Other']['n_points']}\t{intra_knn['Other']['avg_knn_intra_cosine_distance']:.6f}\n")
 
-    # 3+4) Centroid distance + centroid-based separation effect size
-    pairs = inter_order_separation_effect_size(Xn, order_labels, top_order_list)
+    # 3) centroid+dispersion separation
+    pairs = order_pair_separation_effect(Xn, order_labels, top_order_list)
     pair_path = args.out_dir / "order_pair_separation.tsv"
     with pair_path.open("w", encoding="utf-8") as f:
-        f.write("order_a\torder_b\tcount_a\tcount_b\tcentroid_cosine_dist\tsigma2_a\tsigma2_b\tseparation_effect\n")
-        for a, b, nA, nB, dist, s2a, s2b, sep in pairs:
-            if np.isnan(dist) or np.isnan(sep):
-                f.write(f"{a}\t{b}\t{nA}\t{nB}\tNA\t{s2a:.6g}\t{s2b:.6g}\tNA\n")
-            else:
-                f.write(f"{a}\t{b}\t{nA}\t{nB}\t{dist:.6f}\t{s2a:.6g}\t{s2b:.6g}\t{sep:.6f}\n")
+        f.write("order_a\torder_b\tcentroid_cosine_dist\tsigma2_a\tsigma2_b\tseparation_effect\n")
+        for a, b, dc, s2a, s2b, eff in pairs:
+            f.write(f"{a}\t{b}\t{dc:.6f}\t{s2a:.6f}\t{s2b:.6f}\t{eff:.6f}\n")
 
-    # 5) NEW: kNN inter-order margin (local overlap / mixing)
+    # 4) kNN inter-order margin
     knn_pairs = knn_inter_order_margin(Xn, order_labels, neigh_idx, top_order_list)
     knn_pair_path = args.out_dir / "order_pair_knn_margin.tsv"
     with knn_pair_path.open("w", encoding="utf-8") as f:
@@ -736,32 +640,22 @@ def main():
         f"  Other: n={intra_knn['Other']['n_points']}, avg_knn_intra_dist={_fmt(intra_knn['Other']['avg_knn_intra_cosine_distance'])}"
     )
 
-    lines += ["", "3+4) Centroid-based separation effect size (higher = more separated vs spread):"]
-    pairs_sorted = sorted([p for p in pairs if not np.isnan(p[-1])], key=lambda t: t[-1], reverse=True)
-    for a, b, nA, nB, dist, s2a, s2b, sep in pairs_sorted[:10]:
-        lines.append(f"  {a} vs {b}: centroid_dist={dist:.4f}, sep_effect={sep:.4f}")
+    lines += ["", "3) Inter-order separation effect (centroid dist / dispersion):",
+              "   (larger = more separated after accounting for within-order spread)"]
+    # show top 10 by effect size
+    pairs_sorted = sorted(pairs, key=lambda x: x[-1], reverse=True)
+    for a, b, dc, s2a, s2b, eff in pairs_sorted[:10]:
+        lines.append(f"  {a} vs {b}: effect={_fmt(eff)}, centroid_dist={_fmt(dc)}, sigma2=({_fmt(s2a)}, {_fmt(s2b)})")
 
-    lines += ["", "5) kNN inter-order margin (symmetric; higher = less local mixing):"]
-    knn_pairs_sorted = sorted([p for p in knn_pairs if not np.isnan(p[-1])], key=lambda t: t[-1], reverse=True)
+    lines += ["", "4) kNN inter-order margin (local mixing):",
+              "   (larger = farther from the other order than from own order, locally)"]
+    knn_pairs_sorted = sorted(knn_pairs, key=lambda x: (x[-1] if x[-1] == x[-1] else -1e9), reverse=True)
     for a, b, m_ab, n_ab, m_ba, n_ba, sym in knn_pairs_sorted[:10]:
-        lines.append(f"  {a} vs {b}: sym_margin={sym:.4f} (A->B={_fmt(m_ab)}, nA={n_ab}; B->A={_fmt(m_ba)}, nB={n_ba})")
-
-    lines += [
-        "",
-        "Files written:",
-        f"  {knn_path.name}",
-        f"  {intra_path.name}",
-        f"  {pair_path.name}",
-        f"  {knn_pair_path.name}",
-    ]
+        lines.append(f"  {a} vs {b}: sym_margin={_fmt(sym)} (A->B={_fmt(m_ab)}, B->A={_fmt(m_ba)})")
 
     (args.out_dir / "summary.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     print("Wrote plots + metrics to:", args.out_dir)
-    print(f"- {knn_path.name}")
-    print(f"- {intra_path.name}")
-    print(f"- {pair_path.name}")
-    print(f"- {knn_pair_path.name}")
 
 
 if __name__ == "__main__":
