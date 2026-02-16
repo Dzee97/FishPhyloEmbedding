@@ -80,16 +80,46 @@ def read_species_taxonomy_tsv(path: Path):
     return species_sorted, family_labels, order_labels
 
 
+def _torch_load_compat(path: Path):
+    """
+    PyTorch 2.6+ defaults weights_only=True, which can fail if checkpoint contains
+    non-allowlisted objects (e.g., pathlib.PosixPath inside args).
+    We:
+      1) try weights_only=True
+      2) fallback to weights_only=False if needed (safe if you trust the checkpoint).
+    Also compatible with older torch versions that don't support weights_only.
+    """
+    try:
+        # Try safe load first (torch>=2.6)
+        return torch.load(str(path), map_location="cpu", weights_only=True)
+    except TypeError:
+        # torch<2.6 doesn't know weights_only
+        return torch.load(str(path), map_location="cpu")
+    except Exception as e:
+        # Likely weights_only failure; retry full unpickle
+        print(
+            "WARNING: torch.load(weights_only=True) failed.\n"
+            "Retrying with weights_only=False (this unpickles arbitrary objects).\n"
+            "Only do this for checkpoints you trust.\n"
+            f"Original error: {repr(e)}"
+        )
+        try:
+            return torch.load(str(path), map_location="cpu", weights_only=False)
+        except TypeError:
+            # torch<2.6 path
+            return torch.load(str(path), map_location="cpu")
+
+
 def load_species_embeddings_from_ckpt(ckpt_path: Path, species_sorted_expected: list):
     """
     Priority:
       1) ckpt["species_emb_weight"] (preferred; exported by both scripts)
       2) state_dict key that ends with "species_emb.weight" (legacy baseline)
     """
-    ckpt = torch.load(str(ckpt_path), map_location="cpu")
+    ckpt = _torch_load_compat(ckpt_path)
 
     # Preferred unified export
-    if "species_emb_weight" in ckpt:
+    if isinstance(ckpt, dict) and "species_emb_weight" in ckpt:
         W = ckpt["species_emb_weight"]
         if isinstance(W, torch.Tensor):
             W = W.detach().cpu().numpy()
@@ -112,7 +142,7 @@ def load_species_embeddings_from_ckpt(ckpt_path: Path, species_sorted_expected: 
         return W
 
     # Legacy fallback: baseline species_emb.weight inside state_dict
-    if "model" not in ckpt:
+    if not isinstance(ckpt, dict) or "model" not in ckpt:
         raise RuntimeError("Checkpoint missing 'model' state_dict and missing 'species_emb_weight' export.")
     sd = ckpt["model"]
 
