@@ -447,7 +447,7 @@ def main():
 
             if step % 50 == 0:
                 it_s = step / max(1e-9, (time.time() - t0))
-                print(f"epoch={epoch} step={step} loss={loss.item():.4f} it/s={it_s:.2f}")
+                print(f"epoch={epoch} step={step} loss={loss.item():.6f} it/s={it_s:.2f}")
 
             if step % 50 == 0:
                 with metrics_path.open("a", encoding="utf-8") as f:
