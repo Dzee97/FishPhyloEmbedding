@@ -357,7 +357,7 @@ def knn_restricted_intra_order_cosine_distance(Xn: np.ndarray, order_labels: lis
     return out
 
 
-def order_pair_separation_effect(Xn: np.ndarray, order_labels: list, top_order_list: list) -> List[Tuple[str, str, float, float, float, float]]:
+def order_pair_separation_effect(Xn: np.ndarray, order_labels: list, top_order_list: list) -> list[tuple[str, str, float, float, float, float]]:
     """
     Pair separation based on centroid distance normalized by within-order dispersion:
       centroid_cosine_dist = 1 - dot(cA, cB)
