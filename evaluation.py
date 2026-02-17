@@ -11,11 +11,18 @@ Reads:
 - species_taxonomy.tsv for order/family labels
 
 Writes:
-- pca_order.png  (top orders highlighted; other orders in light gray)
-- pca_families_in_<ORDER>.png for each top order (ALL points; non-target orders in gray)
+PCA plots:
+- pca_order_pc1_pc2.png  (top orders highlighted; other orders in light gray)
+- pca_order_pc1_pc3.png
+- pca_order_pc2_pc3.png
+- pca_families_in_<ORDER>_pc1_pc2.png (ALL points; non-target orders in gray)
+- pca_families_in_<ORDER>_pc1_pc3.png
+- pca_families_in_<ORDER>_pc2_pc3.png
+- pca_explained_variance.png  (up to --pca_components)
+
+UMAP plots:
 - umap_order.png
 - umap_families_in_<ORDER>.png for each top order
-- summary.txt
 
 Quantitative outputs (cosine-based):
 1) knn_order_purity.tsv
@@ -90,13 +97,10 @@ def _torch_load_compat(path: Path):
     Also compatible with older torch versions that don't support weights_only.
     """
     try:
-        # Try safe load first (torch>=2.6)
         return torch.load(str(path), map_location="cpu", weights_only=True)
     except TypeError:
-        # torch<2.6 doesn't know weights_only
         return torch.load(str(path), map_location="cpu")
     except Exception as e:
-        # Likely weights_only failure; retry full unpickle
         print(
             "WARNING: torch.load(weights_only=True) failed.\n"
             "Retrying with weights_only=False (this unpickles arbitrary objects).\n"
@@ -106,7 +110,6 @@ def _torch_load_compat(path: Path):
         try:
             return torch.load(str(path), map_location="cpu", weights_only=False)
         except TypeError:
-            # torch<2.6 path
             return torch.load(str(path), map_location="cpu")
 
 
@@ -126,7 +129,6 @@ def load_species_embeddings_from_ckpt(ckpt_path: Path, species_sorted_expected: 
         else:
             W = np.asarray(W)
 
-        # Optional sanity check if the ckpt stores ordering
         if "species_sorted" in ckpt:
             sp_ckpt = ckpt["species_sorted"]
             if list(sp_ckpt) != list(species_sorted_expected):
@@ -141,7 +143,7 @@ def load_species_embeddings_from_ckpt(ckpt_path: Path, species_sorted_expected: 
             )
         return W
 
-    # Legacy fallback: baseline species_emb.weight inside state_dict
+    # Legacy fallback
     if not isinstance(ckpt, dict) or "model" not in ckpt:
         raise RuntimeError("Checkpoint missing 'model' state_dict and missing 'species_emb_weight' export.")
     sd = ckpt["model"]
@@ -264,6 +266,7 @@ def per_order_family_plots(
     xlabel: str = "dim1",
     ylabel: str = "dim2",
     background_color=(0.82, 0.82, 0.82, 0.35),
+    suffix: str = "",
 ):
     order_arr = np.array(order_labels)
     family_arr = np.array(family_labels)
@@ -296,7 +299,7 @@ def per_order_family_plots(
             else:
                 colors.append(fam_to_color.get(lab, fam_to_color["Other"]))
 
-        outpath = out_dir / f"{prefix}_families_in_{slugify(o)}.png"
+        outpath = out_dir / f"{prefix}_families_in_{slugify(o)}{suffix}.png"
         scatter_plot_2d(
             X2, labels,
             title=f"{prefix.upper()} — Families highlighted within order: {o}",
@@ -307,6 +310,30 @@ def per_order_family_plots(
             colors=colors,
             legend_exclude={"Background"},
         )
+
+
+def plot_pca_explained_variance(pca: PCA, outpath: Path, max_components: int):
+    """
+    Plot explained variance ratio per PC and cumulative, up to max_components.
+    """
+    var = np.asarray(pca.explained_variance_ratio_)
+    m = min(max_components, var.shape[0])
+    xs = np.arange(1, m + 1)
+    y = var[:m]
+    ycum = np.cumsum(y)
+
+    plt.figure(figsize=(10, 5))
+    plt.plot(xs, y, marker="o", linewidth=1.5, label="Explained variance (per PC)")
+    plt.plot(xs, ycum, marker="o", linewidth=1.5, label="Cumulative explained variance")
+    plt.xlabel("Principal component")
+    plt.ylabel("Explained variance ratio")
+    plt.title(f"PCA explained variance (first {m} PCs)")
+    plt.xticks(xs)
+    plt.grid(True, alpha=0.3)
+    plt.legend(loc="best")
+    plt.tight_layout()
+    plt.savefig(outpath, dpi=200)
+    plt.close()
 
 
 # ----------------------------
@@ -326,7 +353,7 @@ def build_knn_indices_cosine(Xn: np.ndarray, k: int):
     nn = NearestNeighbors(n_neighbors=k + 1, metric="cosine", algorithm="brute")
     nn.fit(Xn)
     neigh_idx = nn.kneighbors(return_distance=False)
-    neigh_idx = neigh_idx[:, 1:]  # drop self
+    neigh_idx = neigh_idx[:, 1:]
     return neigh_idx
 
 
@@ -535,42 +562,109 @@ def main():
     top_order_list = top_orders(order_labels, args.max_orders)
 
     # --------------------
-    # PCA 2D plots
+    # PCA (up to pca_components)
     # --------------------
-    pca2 = PCA(n_components=2, random_state=args.seed)
-    X_pca2 = pca2.fit_transform(W)
-    var = pca2.explained_variance_ratio_
-    xlabel = f"PC1 ({var[0]*100:.1f}% var)"
-    ylabel = f"PC2 ({var[1]*100:.1f}% var)"
+    pca_full = PCA(n_components=min(args.pca_components, W.shape[1]), random_state=args.seed)
+    Wp = pca_full.fit_transform(W)
 
-    highlight_top_orders_plot(
-        X_pca2,
-        order_labels,
-        outpath=args.out_dir / "pca_order.png",
-        top_order_list=top_order_list,
-        title="PCA (2D) — Top orders highlighted (others in gray)",
-        max_orders=args.max_orders,
-        xlabel=xlabel, ylabel=ylabel
+    # Explained variance plot
+    plot_pca_explained_variance(
+        pca_full,
+        outpath=args.out_dir / "pca_explained_variance.png",
+        max_components=min(args.pca_components, W.shape[1]),
     )
 
+    # PCA scatter plots: PC1/2, PC1/3, PC2/3 (need at least 3 PCs)
+    need_3 = min(args.pca_components, W.shape[1]) >= 3
+    if not need_3:
+        print("WARNING: pca_components < 3 (or embedding dim < 3), cannot plot PC3 variants.")
+
+    def pc_label(i: int) -> str:
+        var = pca_full.explained_variance_ratio_
+        return f"PC{i+1} ({var[i]*100:.1f}% var)"
+
+    # Helper to slice two PCs
+    def pca_pair(i: int, j: int) -> np.ndarray:
+        return Wp[:, [i, j]]
+
+    # --- PC1 vs PC2
+    X12 = pca_pair(0, 1)
+    highlight_top_orders_plot(
+        X12,
+        order_labels,
+        outpath=args.out_dir / "pca_order_pc1_pc2.png",
+        top_order_list=top_order_list,
+        title="PCA — Top orders highlighted (PC1 vs PC2; others in gray)",
+        max_orders=args.max_orders,
+        xlabel=pc_label(0),
+        ylabel=pc_label(1),
+    )
     per_order_family_plots(
-        X_pca2,
+        X12,
         order_labels=order_labels,
         family_labels=family_labels,
         out_dir=args.out_dir,
         prefix="pca",
         top_order_list=top_order_list,
         max_families=args.max_families,
-        xlabel=xlabel,
-        ylabel=ylabel,
+        xlabel=pc_label(0),
+        ylabel=pc_label(1),
+        suffix="_pc1_pc2",
     )
 
-    # --------------------
-    # UMAP plots
-    # --------------------
-    pca = PCA(n_components=min(args.pca_components, W.shape[1]), random_state=args.seed)
-    Wp = pca.fit_transform(W)
+    # --- PC1 vs PC3, PC2 vs PC3
+    if need_3:
+        X13 = pca_pair(0, 2)
+        highlight_top_orders_plot(
+            X13,
+            order_labels,
+            outpath=args.out_dir / "pca_order_pc1_pc3.png",
+            top_order_list=top_order_list,
+            title="PCA — Top orders highlighted (PC1 vs PC3; others in gray)",
+            max_orders=args.max_orders,
+            xlabel=pc_label(0),
+            ylabel=pc_label(2),
+        )
+        per_order_family_plots(
+            X13,
+            order_labels=order_labels,
+            family_labels=family_labels,
+            out_dir=args.out_dir,
+            prefix="pca",
+            top_order_list=top_order_list,
+            max_families=args.max_families,
+            xlabel=pc_label(0),
+            ylabel=pc_label(2),
+            suffix="_pc1_pc3",
+        )
 
+        X23 = pca_pair(1, 2)
+        highlight_top_orders_plot(
+            X23,
+            order_labels,
+            outpath=args.out_dir / "pca_order_pc2_pc3.png",
+            top_order_list=top_order_list,
+            title="PCA — Top orders highlighted (PC2 vs PC3; others in gray)",
+            max_orders=args.max_orders,
+            xlabel=pc_label(1),
+            ylabel=pc_label(2),
+        )
+        per_order_family_plots(
+            X23,
+            order_labels=order_labels,
+            family_labels=family_labels,
+            out_dir=args.out_dir,
+            prefix="pca",
+            top_order_list=top_order_list,
+            max_families=args.max_families,
+            xlabel=pc_label(1),
+            ylabel=pc_label(2),
+            suffix="_pc2_pc3",
+        )
+
+    # --------------------
+    # UMAP plots (still uses Wp from pca_full)
+    # --------------------
     reducer = umap.UMAP(
         n_neighbors=args.umap_neighbors,
         min_dist=args.umap_min_dist,
