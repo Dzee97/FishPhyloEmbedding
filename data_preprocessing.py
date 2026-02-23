@@ -12,8 +12,11 @@ OUTPUTS:
   - report.txt
   - drop_examples.txt
   - iTOL colorstrip datasets (IDs match EXACT tree tip labels; works with trinomials):
-      itol_order_colorstrip.txt   (legend shows top-10 orders)
-      itol_family_colorstrip.txt  (legend shows top-10 families)
+      itol_order_colorstrip.txt   (legend shows top-N orders)
+      itol_family_colorstrip.txt  (legend shows top-N families)
+  - NEW: leaf_hops.npz
+      leaf_nodes: [L] node ids (int32)
+      hop_dist:   [L, L] leaf-to-leaf hop distances (uint16; 65535 means unreachable)
 
 Requires:
   pip install biopython networkx numpy
@@ -23,7 +26,7 @@ import argparse
 import json
 import re
 import hashlib
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
 from pathlib import Path
 from typing import Dict, Optional, List, Tuple
 
@@ -180,7 +183,7 @@ def write_itol_colorstrip_with_legend(
     iTOL DATASET_COLORSTRIP:
       <ID> <COLOR> <optional label>
 
-    Adds a legend containing ONLY `top_legend_groups` (e.g. top 10 orders/families).
+    Adds a legend containing ONLY `top_legend_groups`.
     IDs must match tree leaf labels EXACTLY (including spaces/trinomials).
     """
     lines = []
@@ -192,10 +195,11 @@ def write_itol_colorstrip_with_legend(
     lines.append("COLOR_BRANCHES\t0")
 
     if top_legend_groups:
-        # Legend entries (squares)
         legend_colors = [_hex_color_for_category(g) for g in top_legend_groups]
         legend_shapes = ["1"] * len(top_legend_groups)  # square
-        # For fields with multiple values, iTOL expects space-separated lists even with TAB separator.
+
+        # IMPORTANT: these must be TAB separated (not space-separated),
+        # otherwise iTOL interprets the whole line as one invalid color string.
         lines.append("LEGEND_SHAPES\t" + "\t".join(legend_shapes))
         lines.append("LEGEND_COLORS\t" + "\t".join(legend_colors))
         lines.append("LEGEND_LABELS\t" + "\t".join([g.replace(" ", "_") for g in top_legend_groups]))
@@ -205,7 +209,6 @@ def write_itol_colorstrip_with_legend(
     for node_id, grp in sorted(id_to_group.items(), key=lambda x: x[0]):
         grp = grp if grp and grp.strip() else "Unknown"
         col = _hex_color_for_category(grp)
-        # ID \t color \t label
         lines.append(f"{node_id}\t{col}\t{grp}")
 
     outpath.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -215,7 +218,7 @@ def build_tipname_to_group(tree, species_to_group: Dict[str, str]) -> Dict[str, 
     """
     Map *actual tree tip names* -> group, by normalizing tip to binomial for lookup.
 
-    This fixes iTOL errors when the tree contains trinomials like:
+    Fixes iTOL errors when tree contains trinomials like:
       "Aethotaxis mitopteryx mitopteryx"
     while our species keys are binomials:
       "Aethotaxis_mitopteryx"
@@ -296,6 +299,60 @@ def build_graph_from_tree(tree) -> Tuple[np.ndarray, np.ndarray, Dict[str, int],
     return edge_index, edge_attr, leaf_map, node_rows
 
 
+def build_adj_from_edge_index(edge_index: np.ndarray, num_nodes: int) -> List[List[int]]:
+    adj = [[] for _ in range(num_nodes)]
+    src = edge_index[0]
+    dst = edge_index[1]
+    for u, v in zip(src.tolist(), dst.tolist()):
+        adj[u].append(v)
+    return adj
+
+
+def compute_leaf_hop_matrix(adj: List[List[int]], leaf_nodes: np.ndarray) -> np.ndarray:
+    """
+    Compute leaf-to-leaf hop distances (unweighted shortest path lengths in hops).
+
+    Returns:
+      hop_dist: uint16 [L, L] where hop_dist[i,j] is hops between leaf_nodes[i] and leaf_nodes[j]
+                0 on diagonal; 65535 if unreachable.
+    """
+    L = int(len(leaf_nodes))
+    N = int(len(adj))
+    leaf_index = {int(n): i for i, n in enumerate(leaf_nodes)}
+
+    INF = np.uint16(65535)
+    hop = np.full((L, L), INF, dtype=np.uint16)
+
+    # BFS per leaf (tree is connected; this is fine)
+    for i, start in enumerate(leaf_nodes.tolist()):
+        dist = np.full((N,), -1, dtype=np.int32)
+        q = deque([start])
+        dist[start] = 0
+
+        # self
+        hop[i, i] = np.uint16(0)
+
+        found = 1  # we already know self
+        while q and found < L:
+            u = q.popleft()
+            du = dist[u]
+            for v in adj[u]:
+                if dist[v] != -1:
+                    continue
+                dist[v] = du + 1
+                q.append(v)
+
+                j = leaf_index.get(v, None)
+                if j is not None:
+                    hop[i, j] = np.uint16(dist[v])
+                    found += 1
+
+        if (i + 1) % 250 == 0 or (i + 1) == L:
+            print(f"[leaf_hops] computed {i+1}/{L} BFS rows...")
+
+    return hop
+
+
 # ---------------------------
 # Main
 # ---------------------------
@@ -315,6 +372,10 @@ def main():
 
     # iTOL legend sizes
     ap.add_argument("--itol_legend_top", type=int, default=10, help="Top-N groups to show in iTOL legend")
+
+    # Leaf hop matrix
+    ap.add_argument("--compute_leaf_hops", action="store_true",
+                    help="Compute leaf-to-leaf hop distance matrix (can take a bit).")
 
     args = ap.parse_args()
 
@@ -627,7 +688,6 @@ def main():
     tip_to_order = build_tipname_to_group(tree, species_to_order)
     tip_to_family = build_tipname_to_group(tree, species_to_family)
 
-    # Determine top-N legend entries by number of tips in the pruned tree
     order_counts = Counter(tip_to_order.values())
     family_counts = Counter(tip_to_family.values())
     top_orders = [g for g, _ in order_counts.most_common(args.itol_legend_top)]
@@ -645,6 +705,20 @@ def main():
         "Family",
         top_families
     )
+
+    # --------------------------------------
+    # NEW: Leaf hop distance matrix for training
+    # --------------------------------------
+    if args.compute_leaf_hops:
+        num_nodes = int(max(nid for nid, _, _ in node_rows) + 1)
+        adj = build_adj_from_edge_index(edge_index, num_nodes=num_nodes)
+
+        leaf_nodes = np.array(sorted(set(leaf_map.values())), dtype=np.int32)
+        print(f"[leaf_hops] computing hop matrix for L={len(leaf_nodes)} leaves ...")
+        hop_dist = compute_leaf_hop_matrix(adj, leaf_nodes)
+
+        np.savez(out_dir / "leaf_hops.npz", leaf_nodes=leaf_nodes, hop_dist=hop_dist)
+        print("[leaf_hops] wrote:", out_dir / "leaf_hops.npz")
 
     # report.txt
     summary = []
@@ -664,6 +738,8 @@ def main():
     summary.append(f"  itol_family_colorstrip.txt:    {out_dir / 'itol_family_colorstrip.txt'}")
     summary.append(f"\nTop-{args.itol_legend_top} legend orders: " + ", ".join(top_orders))
     summary.append(f"Top-{args.itol_legend_top} legend families: " + ", ".join(top_families))
+    if args.compute_leaf_hops:
+        summary.append(f"\nLeaf hop matrix: {out_dir / 'leaf_hops.npz'} (uint16; 65535=unreachable)")
 
     (out_dir / "report.txt").write_text("\n".join(summary) + "\n", encoding="utf-8")
 

@@ -3,62 +3,52 @@
 Stage 1 (phylogeny-only): Learn species embeddings from the pruned phylogeny graph using a GNN.
 
 Inputs (from preprocessing out_dir):
-  - edge_index.npz     (directed edges, shape [2, E])
-  - edge_attr.npz      (optional; branch lengths, shape [E, 1])  [not used by default]
-  - nodes.tsv          (node_id, is_tip, name) where name is normalized binomial for tips (may be empty for internals)
-  - leaf_map.tsv       (species -> node_id), species is normalized binomial Genus_species
-  - species_taxonomy.tsv (species list; used to define *ordering* of exported species embeddings)
+  - edge_index.npz
+  - nodes.tsv
+  - leaf_map.tsv
+  - species_taxonomy.tsv
+  - NEW: leaf_hops.npz  (leaf_nodes [L], hop_dist [L,L])
 
 Outputs:
   - runs/<name>/checkpoints/*.pt  (includes "species_emb_weight" + "species_sorted")
 
-Objective:
-  - Triplet loss in cosine space:
-      d(u,v)=1-cos(u,v)
-      enforce d(a,p) + margin < d(a,n)
+Triplet loss in cosine space:
+  d(u,v)=1-cos(u,v)
+  enforce d(a,p) + margin < d(a,n)
 
-Sampling (NEW):
-  You can choose how to sample positives on the tree:
-    1) pos_sampling=within
-       - pick positive uniformly among all leaf nodes within <= pos_max_hops hops from anchor
-    2) pos_sampling=uniform_hop
-       - first sample hop distance h ~ Uniform{1..pos_max_hops}
-       - then sample positive uniformly among leaves at exactly hop distance h
-       - if none exist for that h, resample h a few times, then fall back to "within"
+Sampling now uses the precomputed leaf hop matrix (no BFS per step):
 
-  Negatives:
-    - after picking a positive at hop distance h_pos, sample a negative uniformly among
-      leaf nodes that are at least (h_pos + neg_min_hops) hops away from anchor.
-    - implemented by excluding all nodes within <= (h_pos + neg_min_hops - 1) hops.
+Positives:
+  --pos_sampling within:
+     pick positive uniformly among all leaves with 1..pos_max_hops hops from anchor
+  --pos_sampling uniform_hop:
+     sample hop h ~ Uniform{1..pos_max_hops}, then pick uniformly among leaves at hop h
+     (resamples; fallback to within)
+
+Negatives:
+  --neg_sampling outside:
+     pick uniformly among leaves with hop >= (h_pos + neg_min_hops)
+  --neg_sampling uniform_hop:
+     sample hop h_neg ~ Uniform{min_neg .. max_neg} then pick uniformly among leaves at hop h_neg
+     where min_neg = h_pos + neg_min_hops
+     max_neg = --neg_max_hops if set else max finite hop for that anchor
+     (resamples; fallback to outside)
+
+GNN types:
+  --gnn_type gcn   : mean neighbor aggregation (like your current)
+  --gnn_type sage  : GraphSAGE mean aggregator with self+neighbor concatenation
 
 Dependencies:
   pip install torch numpy
-
-Run example:
-  python stage1_gnn_phylo.py \
-    --data_dir output \
-    --out_dir runs/gnn_phylo1 \
-    --emb_dim 256 \
-    --n_layers 3 \
-    --steps_per_epoch 2000 \
-    --epochs 20 \
-    --batch_anchors 512 \
-    --pos_max_hops 30 \
-    --pos_sampling uniform_hop \
-    --neg_min_hops 1 \
-    --margin 0.1 \
-    --lr 3e-3 \
-    --amp
 """
 
 import argparse
 import json
-import math
 import random
 import time
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional, Set
-from collections import Counter, defaultdict
+from typing import Dict, List, Tuple, Optional
+from collections import Counter
 
 import numpy as np
 import torch
@@ -142,172 +132,244 @@ def load_edge_index(path: Path) -> np.ndarray:
     return ei
 
 
-# -----------------------------
-# Graph utilities
-# -----------------------------
-
-def build_adj_lists(edge_index: np.ndarray, num_nodes: int) -> List[List[int]]:
-    """
-    edge_index is directed; for neighborhood sampling we treat it as (effectively) undirected
-    because preprocessing saved both directions. We just use adjacency as given.
-    """
-    adj = [[] for _ in range(num_nodes)]
-    src = edge_index[0]
-    dst = edge_index[1]
-    for u, v in zip(src.tolist(), dst.tolist()):
-        adj[u].append(v)
-    return adj
-
-
-def bfs_leaf_buckets_and_cumulative(
-    adj: List[List[int]],
-    start: int,
-    max_hops: int,
-    leaf_set: Set[int],
-) -> Tuple[Dict[int, List[int]], List[Set[int]]]:
-    """
-    BFS out to max_hops.
-
-    Returns:
-      leaf_by_hop: dict hop -> list of leaf node ids at exactly that hop (excluding start)
-      cumulative_nodes: list of sets, cumulative_nodes[h] = nodes within <=h hops (includes start)
-                        length = max_hops+1
-    """
-    leaf_by_hop: Dict[int, List[int]] = defaultdict(list)
-
-    seen = {start}
-    frontier = {start}
-    cumulative_nodes: List[Set[int]] = [set([start])]
-
-    for hop in range(1, max_hops + 1):
-        nxt = set()
-        for u in frontier:
-            for v in adj[u]:
-                if v not in seen:
-                    seen.add(v)
-                    nxt.add(v)
-
-        # collect leaves at exactly this hop
-        for v in nxt:
-            if v in leaf_set:
-                leaf_by_hop[hop].append(v)
-
-        # cumulative set up to this hop
-        cumulative_nodes.append(cumulative_nodes[-1] | nxt)
-
-        frontier = nxt
-        if not frontier:
-            # pad remaining cumulative sets (so indexing works)
-            for _ in range(hop + 1, max_hops + 1):
-                cumulative_nodes.append(set(cumulative_nodes[-1]))
-            break
-
-    return leaf_by_hop, cumulative_nodes
-
-
-def sample_positive(
-    leaf_by_hop: Dict[int, List[int]],
-    pos_max_hops: int,
-    rng: random.Random,
-    strategy: str,
-    max_h_resamples: int,
-) -> Tuple[Optional[int], int]:
-    """
-    Returns (pos_node, pos_hop). pos_node=None if no candidates found.
-    """
-    # Quick total candidates in <=pos_max_hops
-    counts = {h: len(leaf_by_hop.get(h, [])) for h in range(1, pos_max_hops + 1)}
-    total = sum(counts.values())
-    if total == 0:
-        return None, 0
-
-    if strategy == "within":
-        # uniform among all leaves within <= pos_max_hops
-        r = rng.randrange(total)
-        acc = 0
-        for h in range(1, pos_max_hops + 1):
-            c = counts[h]
-            if c == 0:
-                continue
-            if r < acc + c:
-                pos = rng.choice(leaf_by_hop[h])
-                return pos, h
-            acc += c
-        # should not happen
-        h = max((h for h in range(1, pos_max_hops + 1) if counts[h] > 0), default=1)
-        return rng.choice(leaf_by_hop[h]), h
-
-    elif strategy == "uniform_hop":
-        # sample hop distance first, then a leaf at that exact distance
-        for _ in range(max_h_resamples):
-            h = rng.randint(1, pos_max_hops)
-            bucket = leaf_by_hop.get(h, [])
-            if bucket:
-                return rng.choice(bucket), h
-        # fallback to within
-        r = rng.randrange(total)
-        acc = 0
-        for h in range(1, pos_max_hops + 1):
-            c = counts[h]
-            if c == 0:
-                continue
-            if r < acc + c:
-                return rng.choice(leaf_by_hop[h]), h
-            acc += c
-        h = max((h for h in range(1, pos_max_hops + 1) if counts[h] > 0), default=1)
-        return rng.choice(leaf_by_hop[h]), h
-
-    else:
-        raise ValueError(f"Unknown pos sampling strategy: {strategy}")
+def load_leaf_hops(path: Path) -> Tuple[np.ndarray, np.ndarray]:
+    z = np.load(path)
+    if "leaf_nodes" not in z or "hop_dist" not in z:
+        raise RuntimeError(f"{path} must contain leaf_nodes and hop_dist arrays")
+    leaf_nodes = z["leaf_nodes"].astype(np.int32)
+    hop_dist = z["hop_dist"].astype(np.uint16)
+    if hop_dist.shape[0] != hop_dist.shape[1]:
+        raise RuntimeError(f"hop_dist must be square [L,L], got {hop_dist.shape}")
+    if hop_dist.shape[0] != leaf_nodes.shape[0]:
+        raise RuntimeError("leaf_nodes length must match hop_dist size")
+    return leaf_nodes, hop_dist
 
 
 # -----------------------------
-# Simple GCN
+# Sampling utilities (hop matrix)
+# -----------------------------
+
+INF_HOP = np.uint16(65535)
+
+
+class HopSampler:
+    """
+    Uses a precomputed hop distance matrix between leaves.
+    Provides positive/negative sampling according to your strategies, without BFS per step.
+
+    To avoid scanning the full row (L) repeatedly, we build a per-anchor cache
+    the first time a leaf is used as anchor.
+    """
+
+    def __init__(
+        self,
+        hop_dist: np.ndarray,      # [L,L] uint16
+        rng: random.Random,
+        pos_max_hops: int,
+        pos_sampling: str,
+        pos_max_hop_resamples: int,
+        neg_min_hops: int,
+        neg_sampling: str,
+        neg_max_hops: Optional[int],
+        neg_max_hop_resamples: int,
+    ):
+        self.hop = hop_dist
+        self.L = int(hop_dist.shape[0])
+        self.rng = rng
+
+        self.pos_max_hops = int(pos_max_hops)
+        self.pos_sampling = pos_sampling
+        self.pos_max_hop_resamples = int(pos_max_hop_resamples)
+
+        self.neg_min_hops = int(neg_min_hops)
+        self.neg_sampling = neg_sampling
+        self.neg_max_hops = None if neg_max_hops is None else int(neg_max_hops)
+        self.neg_max_hop_resamples = int(neg_max_hop_resamples)
+
+        # cache[ai] = dict with:
+        #   "by_hop": {h: np.ndarray leaf indices at exactly hop h}
+        #   "within": np.ndarray leaf indices at hop 1..pos_max_hops
+        #   "max_finite": int
+        self.cache: Dict[int, dict] = {}
+
+    def _ensure_cache(self, ai: int):
+        if ai in self.cache:
+            return
+
+        row = self.hop[ai]  # [L]
+        # finite distances exclude INF and exclude self (0)
+        finite = row[(row != INF_HOP)]
+        max_finite = int(finite.max()) if finite.size > 0 else 0
+
+        by_hop = {}
+        # build buckets only up to max(pos_max_hops, neg_max_hops if provided)
+        H = self.pos_max_hops
+        if self.neg_max_hops is not None:
+            H = max(H, self.neg_max_hops)
+        H = min(H, max_finite) if max_finite > 0 else H
+
+        # One scan per hop would be slow; instead do one pass over row values:
+        # gather indices for hop 1..H
+        # (still O(L), but only once per anchor leaf)
+        for h in range(1, H + 1):
+            idx = np.where(row == np.uint16(h))[0]
+            if idx.size > 0:
+                by_hop[h] = idx
+
+        within_list = []
+        for h in range(1, min(self.pos_max_hops, H) + 1):
+            if h in by_hop:
+                within_list.append(by_hop[h])
+        within = np.concatenate(within_list) if within_list else np.empty((0,), dtype=np.int64)
+
+        self.cache[ai] = {
+            "by_hop": by_hop,
+            "within": within,
+            "max_finite": max_finite,
+        }
+
+    def sample_positive(self, ai: int) -> Tuple[int, int]:
+        """
+        Returns (pos_leaf_index, pos_hop).
+        If no candidates exist, returns (ai, 0).
+        """
+        self._ensure_cache(ai)
+        c = self.cache[ai]
+        by_hop = c["by_hop"]
+        within = c["within"]
+
+        if within.size == 0:
+            return ai, 0
+
+        if self.pos_sampling == "within":
+            pj = int(within[self.rng.randrange(int(within.size))])
+            h = int(self.hop[ai, pj])
+            return pj, h
+
+        if self.pos_sampling == "uniform_hop":
+            # try sampling hop first
+            for _ in range(self.pos_max_hop_resamples):
+                h = self.rng.randint(1, self.pos_max_hops)
+                bucket = by_hop.get(h, None)
+                if bucket is not None and bucket.size > 0:
+                    pj = int(bucket[self.rng.randrange(int(bucket.size))])
+                    return pj, h
+            # fallback to within
+            pj = int(within[self.rng.randrange(int(within.size))])
+            h = int(self.hop[ai, pj])
+            return pj, h
+
+        raise ValueError(f"Unknown pos_sampling: {self.pos_sampling}")
+
+    def sample_negative(self, ai: int, h_pos: int) -> int:
+        """
+        Returns neg_leaf_index.
+        Enforces hop(ai, neg) >= (h_pos + neg_min_hops), unless fallback happens.
+        """
+        self._ensure_cache(ai)
+        row = self.hop[ai]
+        min_neg = int(h_pos + self.neg_min_hops)
+
+        # Determine max hop to consider (for uniform_hop)
+        max_finite = self.cache[ai]["max_finite"]
+        max_neg = self.neg_max_hops if self.neg_max_hops is not None else max_finite
+        max_neg = max(min_neg, int(max_neg))
+
+        if self.neg_sampling == "outside":
+            # uniform among all leaves farther than threshold
+            cand = np.where((row != INF_HOP) & (row >= np.uint16(min_neg)))[0]
+            if cand.size == 0:
+                # fallback: any random leaf
+                return self.rng.randrange(self.L)
+            return int(cand[self.rng.randrange(int(cand.size))])
+
+        if self.neg_sampling == "uniform_hop":
+            # sample hop first, then choose leaf at exactly that hop
+            # resample a few times, then fallback to outside
+            for _ in range(self.neg_max_hop_resamples):
+                if min_neg > max_neg:
+                    break
+                h = self.rng.randint(min_neg, max_neg)
+                bucket = np.where(row == np.uint16(h))[0]
+                if bucket.size > 0:
+                    return int(bucket[self.rng.randrange(int(bucket.size))])
+
+            cand = np.where((row != INF_HOP) & (row >= np.uint16(min_neg)))[0]
+            if cand.size == 0:
+                return self.rng.randrange(self.L)
+            return int(cand[self.rng.randrange(int(cand.size))])
+
+        raise ValueError(f"Unknown neg_sampling: {self.neg_sampling}")
+
+
+# -----------------------------
+# GNNs
 # -----------------------------
 
 class GCNLayer(nn.Module):
-    def __init__(self, dim_in: int, dim_out: int, dropout: float):
+    def __init__(self, dim: int, dropout: float):
         super().__init__()
-        self.lin = nn.Linear(dim_in, dim_out)
+        self.lin = nn.Linear(dim, dim)
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor, edge_index: torch.Tensor, deg_inv: torch.Tensor) -> torch.Tensor:
-        """
-        x: [N, D]
-        edge_index: [2, E] (directed)
-        deg_inv: [N] = 1/deg for mean aggregation
-
-        mean aggregation:
-          m[v] = mean_{u in N(v)} x[u]
-        """
         src = edge_index[0]
         dst = edge_index[1]
-
         m = torch.zeros_like(x)
         m.index_add_(0, dst, x[src])
         m = m * deg_inv.unsqueeze(1)
-
         h = self.lin(m)
         h = F.gelu(h)
         h = self.dropout(h)
         return h
 
 
-class PhyloGCN(nn.Module):
-    def __init__(self, num_nodes: int, emb_dim: int, n_layers: int, dropout: float):
+class SAGELayer(nn.Module):
+    """
+    GraphSAGE (mean) layer:
+      m[v] = mean_{u in N(v)} x[u]
+      h[v] = W [x[v] || m[v]]
+    """
+
+    def __init__(self, dim: int, dropout: float):
+        super().__init__()
+        self.lin = nn.Linear(2 * dim, dim)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor, edge_index: torch.Tensor, deg_inv: torch.Tensor) -> torch.Tensor:
+        src = edge_index[0]
+        dst = edge_index[1]
+        m = torch.zeros_like(x)
+        m.index_add_(0, dst, x[src])
+        m = m * deg_inv.unsqueeze(1)
+
+        h = torch.cat([x, m], dim=1)
+        h = self.lin(h)
+        h = F.gelu(h)
+        h = self.dropout(h)
+        return h
+
+
+class PhyloGNN(nn.Module):
+    def __init__(self, num_nodes: int, emb_dim: int, n_layers: int, dropout: float, gnn_type: str):
         super().__init__()
         self.node_emb = nn.Embedding(num_nodes, emb_dim)
         nn.init.normal_(self.node_emb.weight, mean=0.0, std=0.02)
 
-        self.layers = nn.ModuleList(
-            [GCNLayer(emb_dim, emb_dim, dropout=dropout) for _ in range(n_layers)]
-        )
+        if gnn_type == "gcn":
+            layer_cls = GCNLayer
+        elif gnn_type == "sage":
+            layer_cls = SAGELayer
+        else:
+            raise ValueError(f"Unknown gnn_type: {gnn_type}")
+
+        self.layers = nn.ModuleList([layer_cls(emb_dim, dropout=dropout) for _ in range(n_layers)])
         self.norm = nn.LayerNorm(emb_dim)
 
     def forward(self, edge_index: torch.Tensor, deg_inv: torch.Tensor) -> torch.Tensor:
-        x = self.node_emb.weight  # [N, D]
+        x = self.node_emb.weight
         for layer in self.layers:
-            x = x + layer(x, edge_index, deg_inv)
+            x = x + layer(x, edge_index, deg_inv)  # residual
         x = self.norm(x)
         return x
 
@@ -336,7 +398,7 @@ def triplet_margin_cosine(z_a: torch.Tensor, z_p: torch.Tensor, z_n: torch.Tenso
 
 @torch.no_grad()
 def export_species_embeddings(
-    model: PhyloGCN,
+    model: PhyloGNN,
     edge_index_t: torch.Tensor,
     deg_inv_t: torch.Tensor,
     species_sorted: List[str],
@@ -345,7 +407,7 @@ def export_species_embeddings(
     model.eval()
     X = model(edge_index_t, deg_inv_t)  # [N, D]
     rows = []
-    D = X.shape[1]
+    D = int(X.shape[1])
     for sp in species_sorted:
         nid = leaf_map.get(sp, None)
         if nid is None:
@@ -375,7 +437,6 @@ def save_checkpoint(
             "step": step,
             "epoch": epoch,
             "args": vars(args),
-            # unified export for evaluation.py
             "species_sorted": species_sorted,
             "species_emb_weight": species_emb_weight,
         },
@@ -393,28 +454,23 @@ def main():
     ap.add_argument("--out_dir", required=True, type=Path)
 
     # Model
+    ap.add_argument("--gnn_type", choices=["gcn", "sage"], default="gcn")
     ap.add_argument("--emb_dim", type=int, default=256)
     ap.add_argument("--n_layers", type=int, default=3)
     ap.add_argument("--dropout", type=float, default=0.1)
 
     # Sampling + loss
-    ap.add_argument("--batch_anchors", type=int, default=256, help="anchors per step (leaf nodes)")
-    ap.add_argument("--pos_max_hops", type=int, default=30, help="positives must be within <= this hop distance")
-    ap.add_argument(
-        "--pos_sampling",
-        choices=["within", "uniform_hop"],
-        default="within",
-        help="Positive sampling strategy: within=uniform among all leaves within <=pos_max_hops; "
-             "uniform_hop=sample hop first then leaf at that hop (fallbacks to within).",
-    )
-    ap.add_argument("--pos_max_hop_resamples", type=int, default=20, help="Resamples for uniform_hop before fallback")
-    ap.add_argument(
-        "--neg_min_hops",
-        type=int,
-        default=1,
-        help="Negatives must be at least (pos_hop + neg_min_hops) away from anchor. "
-             "neg_min_hops=1 means strictly farther than the chosen positive hop.",
-    )
+    ap.add_argument("--batch_anchors", type=int, default=256, help="anchors per step (leaf indices)")
+    ap.add_argument("--pos_max_hops", type=int, default=30)
+    ap.add_argument("--pos_sampling", choices=["within", "uniform_hop"], default="within")
+    ap.add_argument("--pos_max_hop_resamples", type=int, default=30)
+
+    ap.add_argument("--neg_min_hops", type=int, default=1)
+    ap.add_argument("--neg_sampling", choices=["outside", "uniform_hop"], default="outside")
+    ap.add_argument("--neg_max_hops", type=int, default=None,
+                    help="Max hop for negative uniform_hop sampling. If not set, uses max finite hop for anchor.")
+    ap.add_argument("--neg_max_hop_resamples", type=int, default=50)
+
     ap.add_argument("--margin", type=float, default=0.1)
 
     # Training
@@ -429,8 +485,6 @@ def main():
     ap.add_argument("--amp", action="store_true")
     ap.add_argument("--save_every", type=int, default=2000)
     ap.add_argument("--eval_every", type=int, default=500)
-
-    # Logging
     ap.add_argument("--log_every", type=int, default=50)
 
     args = ap.parse_args()
@@ -447,15 +501,14 @@ def main():
     leaf_map = read_leaf_map_tsv(args.data_dir / "leaf_map.tsv")
     species_sorted = read_species_taxonomy_tsv(args.data_dir / "species_taxonomy.tsv")
 
-    num_nodes = int(is_tip.shape[0])
-    leaf_nodes = sorted(set(leaf_map.values()))
-    leaf_set = set(leaf_nodes)
-    print(f"Graph nodes: {num_nodes}")
-    print(f"Leaf nodes (species mapped): {len(leaf_nodes)}")
-    print(f"Species in taxonomy table: {len(species_sorted)}")
+    # Load leaf hop matrix
+    leaf_nodes, hop_dist = load_leaf_hops(args.data_dir / "leaf_hops.npz")
+    L = int(len(leaf_nodes))
+    print(f"Leaf hop matrix: L={L}, dtype={hop_dist.dtype}, shape={hop_dist.shape}")
 
-    # Build adjacency for sampling
-    adj = build_adj_lists(edge_index, num_nodes=num_nodes)
+    num_nodes = int(is_tip.shape[0])
+    print(f"Graph nodes: {num_nodes}")
+    print(f"Species in taxonomy table: {len(species_sorted)}")
 
     # Torch tensors for message passing
     edge_index_t = torch.from_numpy(edge_index).long().to(device)
@@ -467,73 +520,66 @@ def main():
     deg = torch.clamp(deg, min=1.0)
     deg_inv = 1.0 / deg
 
-    model = PhyloGCN(num_nodes=num_nodes, emb_dim=args.emb_dim, n_layers=args.n_layers, dropout=args.dropout).to(device)
+    model = PhyloGNN(
+        num_nodes=num_nodes,
+        emb_dim=args.emb_dim,
+        n_layers=args.n_layers,
+        dropout=args.dropout,
+        gnn_type=args.gnn_type,
+    ).to(device)
+
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scaler = torch.amp.GradScaler("cuda", enabled=args.amp)
 
     metrics_path = args.out_dir / "metrics.jsonl"
     rng = random.Random(args.seed + 999)
 
+    sampler = HopSampler(
+        hop_dist=hop_dist,
+        rng=rng,
+        pos_max_hops=args.pos_max_hops,
+        pos_sampling=args.pos_sampling,
+        pos_max_hop_resamples=args.pos_max_hop_resamples,
+        neg_min_hops=args.neg_min_hops,
+        neg_sampling=args.neg_sampling,
+        neg_max_hops=args.neg_max_hops,
+        neg_max_hop_resamples=args.neg_max_hop_resamples,
+    )
+
     step = 0
     t0 = time.time()
 
-    # For diagnostics of selected positive hops
     pos_hop_counter = Counter()
 
     print("Starting GNN training...")
     for epoch in range(1, args.epochs + 1):
         for _ in range(args.steps_per_epoch):
-            # sample anchors among leaf nodes
-            anchors = [rng.choice(leaf_nodes) for _ in range(args.batch_anchors)]
 
-            pos = []
-            neg = []
+            # sample anchor leaf indices (0..L-1)
+            anchors_li = [rng.randrange(L) for _ in range(args.batch_anchors)]
+
+            pos_li = []
+            neg_li = []
             pos_hops = []
 
-            for a in anchors:
-                leaf_by_hop, cumulative_nodes = bfs_leaf_buckets_and_cumulative(
-                    adj, start=a, max_hops=args.pos_max_hops, leaf_set=leaf_set
-                )
+            for ai in anchors_li:
+                pj, h_pos = sampler.sample_positive(ai)
+                nj = sampler.sample_negative(ai, h_pos=h_pos)
 
-                p, h_pos = sample_positive(
-                    leaf_by_hop=leaf_by_hop,
-                    pos_max_hops=args.pos_max_hops,
-                    rng=rng,
-                    strategy=args.pos_sampling,
-                    max_h_resamples=args.pos_max_hop_resamples,
-                )
-
-                if p is None:
-                    # no nearby positive found (rare unless pos_max_hops tiny / disconnected)
-                    p = a
-                    h_pos = 0
-
-                # negative must be farther than positive by at least neg_min_hops
-                # exclude nodes within <= (h_pos + neg_min_hops - 1)
-                excl_h = max(0, min(args.pos_max_hops, h_pos + args.neg_min_hops - 1))
-                excluded = cumulative_nodes[excl_h] if excl_h < len(cumulative_nodes) else cumulative_nodes[-1]
-
-                tries = 0
-                while True:
-                    cand = rng.choice(leaf_nodes)
-                    tries += 1
-                    if cand not in excluded:
-                        n = cand
-                        break
-                    if tries > 200:
-                        # fallback: allow any random leaf (should be very rare)
-                        n = cand
-                        break
-
-                pos.append(p)
-                neg.append(n)
+                pos_li.append(pj)
+                neg_li.append(nj)
                 pos_hops.append(h_pos)
                 if h_pos > 0:
                     pos_hop_counter[h_pos] += 1
 
-            anchors_t = torch.tensor(anchors, device=device, dtype=torch.long)
-            pos_t = torch.tensor(pos, device=device, dtype=torch.long)
-            neg_t = torch.tensor(neg, device=device, dtype=torch.long)
+            # Map leaf indices -> graph node ids
+            anchors_nodes = leaf_nodes[np.array(anchors_li, dtype=np.int64)]
+            pos_nodes = leaf_nodes[np.array(pos_li, dtype=np.int64)]
+            neg_nodes = leaf_nodes[np.array(neg_li, dtype=np.int64)]
+
+            anchors_t = torch.from_numpy(anchors_nodes).to(device=device, dtype=torch.long)
+            pos_t = torch.from_numpy(pos_nodes).to(device=device, dtype=torch.long)
+            neg_t = torch.from_numpy(neg_nodes).to(device=device, dtype=torch.long)
 
             opt.zero_grad(set_to_none=True)
 
@@ -569,8 +615,12 @@ def main():
                         "pos_hop_hist_top5": top5,
                         "pos_max_hops": args.pos_max_hops,
                         "pos_sampling": args.pos_sampling,
+                        "neg_sampling": args.neg_sampling,
                         "neg_min_hops": args.neg_min_hops,
+                        "neg_max_hops": args.neg_max_hops,
                         "margin": args.margin,
+                        "gnn_type": args.gnn_type,
+                        "n_layers": args.n_layers,
                     }) + "\n")
 
             # periodic export + checkpoint
@@ -585,7 +635,6 @@ def main():
                 )
                 print("Saved:", ckpt_path)
 
-    # final export
     with torch.no_grad():
         W_sp = export_species_embeddings(model, edge_index_t, deg_inv, species_sorted, leaf_map)
     ckpt_path = args.out_dir / "checkpoints" / f"ckpt_final_step{step:07d}.pt"
