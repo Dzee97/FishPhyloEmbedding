@@ -257,7 +257,7 @@ def main():
 
     # Sequence model
     ap.add_argument("--d_model", type=int, default=256)
-    ap.add_argument("--seq_layers", type=int, default=3)
+    ap.add_argument("--seq_layers", type=int, default=4)
     ap.add_argument("--n_heads", type=int, default=4)
     ap.add_argument("--ff_mult", type=int, default=4)
     ap.add_argument("--seq_dropout", type=float, default=0.1)
