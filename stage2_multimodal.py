@@ -351,7 +351,7 @@ def main():
     species_sorted = species_sorted_seq
 
     # Graph tensors
-    edge_index_t = torch.from_numpy(edge_index).to(device=device, dtype=torch.long)
+    edge_index_t = torch.from_numpy(edge_index).long().to(device)
 
     # edge_index: torch.LongTensor [2, E] on device
     num_nodes = int(edge_index.max().item()) + 1  # or pass num_nodes explicitly if you have it
