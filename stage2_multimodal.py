@@ -352,7 +352,15 @@ def main():
 
     # Graph tensors
     edge_index_t = torch.from_numpy(edge_index).to(device=device, dtype=torch.long)
-    deg_inv = s1_phy.compute_deg_inv(edge_index).to(device=device)  # stage1_gnn_phylo helper
+
+    # edge_index: torch.LongTensor [2, E] on device
+    num_nodes = int(edge_index.max().item()) + 1  # or pass num_nodes explicitly if you have it
+
+    dst = edge_index[1]
+    deg = torch.zeros((num_nodes,), device=edge_index.device, dtype=torch.float32)
+    deg.index_add_(0, dst, torch.ones_like(dst, dtype=torch.float32))
+    deg = torch.clamp(deg, min=1.0)
+    deg_inv = 1.0 / deg
 
     # Leaf hop matrix for triplet regularizer (only needed for joint_clip_triplet)
     leaf_nodes = None
