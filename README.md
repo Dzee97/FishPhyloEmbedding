@@ -34,14 +34,14 @@ Our core question is:
 ## Data
 
 ### DNA modality
-- COI fish barcode sequences (∼650 bp)
+- [COI fish barcode sequences](https://mare-mage.weebly.com/coi_db-all-sequences.html) (∼650 bp)
 - Many sequences per species
 - Sequences are **unaligned** and treated as raw strings
 
 ![COI fish barcode sequences](images/Screenshot%20from%202026-02-27%2016-07-42.png)
 
 ### Phylogeny modality
-- A large fish phylogeny (Tree of Life)
+- [A large fish phylogeny](https://fishtreeoflife.org/) (Tree of Life)
 - Species appear as **leaf nodes**
 - Tree converted to a graph:
   - Nodes = internal + leaf nodes
