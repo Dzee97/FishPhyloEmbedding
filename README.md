@@ -193,3 +193,6 @@ and align their outputs.
              │                             │
              └───── alignment loss ────────┘
                         (contrastive)
+
+## Quick Drawing I Used to Explain to Sara
+![](images/FishPhylo.drawio.png)
