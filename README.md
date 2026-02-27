@@ -194,5 +194,5 @@ and align their outputs.
              └───── alignment loss ────────┘
                         (contrastive)
 
-## Quick Drawing I Used to Explain to Sara
+## Quick drawing I used to explain to Sara
 ![](images/FishPhylo.drawio.png)
